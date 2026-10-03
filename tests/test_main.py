@@ -8,9 +8,15 @@ ASTRBOT_ROOT elsewhere so importing astrbot.core leaves the real data/ alone:
 
 import asyncio
 import importlib
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+
+import jinja2
+
+from astrbot.core.utils.t2i.network_strategy import inject_shiki_runtime
 
 main_mod = importlib.import_module("data.plugins.astrbot_plugin_mirasim_status.main")
 MirasimStatus = main_mod.MirasimStatus
@@ -78,7 +84,10 @@ def payload(*models: dict, now_minutes: float | None = None) -> dict:
 def make_plugin(**config) -> MirasimStatus:
     context = MagicMock()
     context.send_message = AsyncMock(return_value=True)
-    plugin = MirasimStatus(context, {"confirm_samples": 2, **config})
+    # Text replies by default, so no test reaches the real T2I service.
+    plugin = MirasimStatus(
+        context, {"confirm_samples": 2, "render_image": False, **config}
+    )
     plugin.put_kv_data = AsyncMock()
     plugin.get_kv_data = AsyncMock(side_effect=lambda key, default: default)
     return plugin
@@ -101,6 +110,7 @@ async def command(plugin: MirasimStatus, *args: str, umo: str = "qq:GroupMessage
     event = MagicMock()
     event.unified_msg_origin = umo
     event.plain_result = lambda text: text
+    event.image_result = lambda path: ("image", path)
     replies = [reply async for reply in plugin.cmd_mirasim(event, *args)]
     return replies[0]
 
@@ -305,6 +315,96 @@ class CommandTest(unittest.TestCase):
         reply = run(command(self.plugin, "sub", "old-model"))
         self.assertIn("没有找到", reply)
         self.assertEqual(self.plugin._subs, {})
+
+
+class ImageTest(unittest.TestCase):
+    def setUp(self):
+        self.data = payload(
+            model("claude-opus-5-5", "UUU", stable_seconds=600),
+            model(
+                "kimi-k3",
+                "Udd",
+                last_error="upstream_incomplete",
+                last_success_at=iso(0),
+            ),
+            model("<b>odd</b>", "UU"),
+            model("old-model", "UU", active=False),
+        )
+        self.plugin = make_plugin(render_image=True)
+        self.plugin._fetch_status = AsyncMock(return_value=self.data)
+
+    def fake_image(self, content: bytes) -> str:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as file:
+            file.write(content)
+        self.addCleanup(Path(file.name).unlink)
+        return file.name
+
+    def rendered_html(self, autoescape: bool) -> str:
+        """Render what the plugin sent to T2I with the same Jinja2 engine.
+
+        StrictUndefined turns a misspelt variable into an error here instead
+        of a blank spot, or a 500 from T2I and a silent text fallback, later.
+        """
+        tmpl, tmpl_data = self.plugin.html_render.await_args.args[:2]
+        env = jinja2.Environment(
+            undefined=jinja2.StrictUndefined, autoescape=autoescape
+        )
+        return env.from_string(tmpl).render(**tmpl_data)
+
+    def test_overview_is_sent_as_an_image(self):
+        path = self.fake_image(b"\x89PNG\r\n\x1a\n...")
+        self.plugin.html_render = AsyncMock(return_value=path)
+        self.assertEqual(run(command(self.plugin)), ("image", path))
+        options = self.plugin.html_render.await_args.kwargs
+        self.assertFalse(options["return_url"])
+        self.assertEqual(options["options"]["device_scale_factor_level"], "ultra")
+
+    def test_template_renders_the_cards(self):
+        self.plugin.config["display_models"] = ["kimi-k3", "claude-opus-5-5", "gpt-9"]
+        self.plugin.html_render = AsyncMock(return_value=self.fake_image(b"\xff\xd8"))
+        run(command(self.plugin))
+
+        for autoescape in (False, True):
+            html = self.rendered_html(autoescape)
+            # Failures first; retired and unlisted models stay out.
+            self.assertLess(html.index("kimi-k3"), html.index("claude-opus-5-5"))
+            self.assertNotIn("old-model", html)
+            self.assertIn("上游输出未完整结束 · 上次成功", html)
+            self.assertIn("连续可用 10分钟", html)
+            self.assertIn("2.3s · 24h 33.3%", html)
+            self.assertIn("未找到：gpt-9", html)
+            self.assertIn("仅展示配置的模型", html)
+            # Samples are right-aligned on the 60-slot strip, newest last.
+            self.assertIn('<i class="down" style="grid-column: 60">', html)
+            self.assertIn('<i class="up" style="grid-column: 58">', html)
+
+    def test_text_from_the_api_is_escaped_whatever_t2i_does(self):
+        self.plugin.html_render = AsyncMock(return_value=self.fake_image(b"\xff\xd8"))
+        run(command(self.plugin, "all"))
+        for autoescape in (False, True):
+            html = self.rendered_html(autoescape)
+            self.assertIn("&lt;b&gt;odd&lt;/b&gt;", html)
+            self.assertNotIn("<b>odd</b>", html)
+
+    def test_error_page_from_t2i_falls_back_to_text(self):
+        page = self.fake_image(b"<html><title>502 Bad Gateway</title></html>")
+        self.plugin.html_render = AsyncMock(return_value=page)
+        reply = run(command(self.plugin))
+        self.assertTrue(reply.startswith("Mirasim 模型状态 · 可用 2/3"))
+
+    def test_render_failure_falls_back_to_text(self):
+        self.plugin.html_render = AsyncMock(side_effect=RuntimeError("down"))
+        self.assertIn("❌ kimi-k3", run(command(self.plugin)))
+
+    def test_detail_view_stays_text(self):
+        self.plugin.html_render = AsyncMock()
+        self.assertTrue(run(command(self.plugin, "kimi")).startswith("❌ kimi-k3"))
+        self.plugin.html_render.assert_not_awaited()
+
+    def test_template_skips_the_shiki_injection(self):
+        # AstrBot otherwise appends a 2.4 MB highlighter to every request.
+        template = main_mod.TEMPLATE_PATH.read_text(encoding="utf-8")
+        self.assertEqual(inject_shiki_runtime(template), template)
 
 
 if __name__ == "__main__":

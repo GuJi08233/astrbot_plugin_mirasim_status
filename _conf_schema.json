@@ -5,6 +5,12 @@
     "hint": "Mirasim 监控站的状态接口，一般无需修改。",
     "default": "https://mirasim-status.521882.xyz/api/status"
   },
+  "render_image": {
+    "description": "状态概览以图片发送",
+    "type": "bool",
+    "hint": "通过 AstrBot 的文转图服务（全局配置里的 t2i_endpoint，默认官方服务）把 /mirasim 的概览渲染成与监控站同款配色的卡片。渲染失败时自动改发文字。单个模型详情和状态推送始终是文字。",
+    "default": true
+  },
   "display_models": {
     "description": "/mirasim 默认展示的模型",
     "type": "list",

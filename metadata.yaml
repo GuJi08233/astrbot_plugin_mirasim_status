@@ -1,7 +1,7 @@
 name: astrbot_plugin_mirasim_status
 display_name: Mirasim 模型状态
 desc: 监控 Mirasim 各模型的可用性，/mirasim 一键查看状态，支持按会话订阅模型并在故障与恢复时推送
-version: v0.1.0
+version: v0.2.0
 author: GuJi08233
 repo: https://github.com/GuJi08233/astrbot_plugin_mirasim_status
 astrbot_version: ">=4.16,<5"

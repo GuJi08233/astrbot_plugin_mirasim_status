@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import re
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -20,6 +22,16 @@ ALL_MODELS = "*"
 ALL_WORDS = ("all", "*", "全部")
 # Samples drawn in the single-model view, matching what fits on a phone line.
 HISTORY_BAR_SAMPLES = 20
+# Samples per row in the overview image, as many as the status page shows.
+HISTORY_IMAGE_SAMPLES = 60
+TEMPLATE_PATH = Path(__file__).parent / "templates" / "status.html"
+# PNG keeps the small text crisp; "ultra" is a 1.8x device pixel ratio on the
+# official T2I service, which phones need once they scale the card down.
+RENDER_OPTIONS = {
+    "type": "png",
+    "full_page": True,
+    "device_scale_factor_level": "ultra",
+}
 
 STATUS_ICONS = {"up": "✅", "down": "❌", "stale": "⏸️", "unknown": "❔"}
 STATUS_NAMES = {"up": "可用", "down": "失败", "stale": "已过期", "unknown": "待检测"}
@@ -128,6 +140,21 @@ def _fmt_latency(value: object) -> str:
     if not isinstance(value, (int, float)) or value < 0:
         return "—"
     return f"{value / 1000:.1f}s"
+
+
+def _fmt_rate(model: dict) -> str:
+    """Format a model's 24h success rate, e.g. ``62.1%`` or ``100%``.
+
+    Args:
+        model: One entry of the payload's ``models``.
+
+    Returns:
+        The formatted rate, or ``—`` before the first sample.
+    """
+    rate = model.get("success_rate_24h")
+    if not isinstance(rate, (int, float)) or not model.get("samples_24h"):
+        return "—"
+    return f"{round(rate, 1):g}%"
 
 
 def _error_text(code: object) -> str:
@@ -390,7 +417,13 @@ class MirasimStatus(Star):
                 if act and act not in ALL_WORDS:
                     text = self._render_model(data, action.strip())
                 else:
-                    text = self._render_overview(data, show_all=bool(act))
+                    show_all = bool(act)
+                    if self.config.get("render_image", True):
+                        path = await self._render_overview_image(data, show_all)
+                        if path:
+                            yield event.image_result(path)
+                            return
+                    text = self._render_overview(data, show_all)
         yield event.plain_result(text)
 
     async def _subscribe(self, umo: str, target: str) -> str:
@@ -476,15 +509,18 @@ class MirasimStatus(Star):
         await self.put_kv_data("subscriptions", self._subs)
         return f"已取消订阅 {model_id}。"
 
-    def _render_overview(self, data: dict, show_all: bool) -> str:
-        """Render the status list of the configured models, or of all of them.
+    def _overview_rows(
+        self, data: dict, show_all: bool
+    ) -> tuple[list[tuple[str, dict]], list[str], bool]:
+        """Pick, filter and sort the models shown in the overview.
 
         Args:
             data: Status payload.
             show_all: Ignore the ``display_models`` setting.
 
         Returns:
-            The reply text.
+            ``(status, model)`` rows with problems first, the configured IDs
+            that were not found, and whether ``display_models`` was applied.
         """
         models = [
             model for model in data["models"] if model.get("id") and model.get("active")
@@ -510,17 +546,25 @@ class MirasimStatus(Star):
             ((_effective_status(model, data), model) for model in models),
             key=lambda row: (STATUS_ORDER[row[0]], row[1]["id"]),
         )
+        return rows, missing, filtered
+
+    def _render_overview(self, data: dict, show_all: bool) -> str:
+        """Render the status list of the configured models, or of all of them.
+
+        Args:
+            data: Status payload.
+            show_all: Ignore the ``display_models`` setting.
+
+        Returns:
+            The reply text.
+        """
+        rows, missing, filtered = self._overview_rows(data, show_all)
         up = sum(1 for status, _ in rows if status == "up")
         lines = [f"Mirasim 模型状态 · 可用 {up}/{len(rows)}"]
         for status, model in rows:
             if status == "up":
-                rate = model.get("success_rate_24h")
-                rate_text = (
-                    f"{round(rate, 1):g}%"
-                    if isinstance(rate, (int, float)) and model.get("samples_24h")
-                    else "—"
-                )
-                detail = f"{_fmt_latency(model.get('latency_ms'))} · 24h {rate_text}"
+                latency = _fmt_latency(model.get("latency_ms"))
+                detail = f"{latency} · 24h {_fmt_rate(model)}"
             elif status == "down":
                 detail = _error_text(model.get("last_error"))
             else:
@@ -542,6 +586,83 @@ class MirasimStatus(Star):
         if filtered:
             lines.append("仅展示配置的模型，发送 /mirasim all 查看全部。")
         return "\n".join(lines)
+
+    async def _render_overview_image(self, data: dict, show_all: bool) -> str | None:
+        """Render the overview as a card image through AstrBot's T2I service.
+
+        Args:
+            data: Status payload.
+            show_all: Ignore the ``display_models`` setting.
+
+        Returns:
+            Path of the rendered image, or None when rendering failed and the
+            caller should fall back to text.
+        """
+        rows, missing, filtered = self._overview_rows(data, show_all)
+        counts = dict.fromkeys(STATUS_ORDER, 0)
+        cards = []
+        for status, model in rows:
+            counts[status] += 1
+            if status == "up":
+                note = f"连续可用 {_fmt_duration(model.get('stable_seconds') or 0)}"
+            elif status == "down":
+                note = _error_text(model.get("last_error"))
+                if model.get("last_success_at"):
+                    note += f" · 上次成功 {_fmt_time(model['last_success_at'])}"
+            elif status == "stale":
+                note = (
+                    f"检测已过期 · 最近检测 {_fmt_time(model.get('last_checked_at'))}"
+                )
+            else:
+                note = "等待首次检测"
+            history = sorted(model.get("history") or [], key=lambda s: s.get("at", ""))
+            latency = _fmt_latency(model.get("latency_ms"))
+            cards.append(
+                {
+                    "id": model["id"],
+                    "status": status,
+                    "label": STATUS_NAMES[status],
+                    "metrics": f"{latency} · 24h {_fmt_rate(model)}",
+                    "note": note,
+                    "history": [
+                        "up" if sample.get("status") == "up" else "down"
+                        for sample in history[-HISTORY_IMAGE_SAMPLES:]
+                    ],
+                }
+            )
+        interval = data.get("interval_seconds")
+        inventory_error = (data.get("inventory") or {}).get("error")
+        url = str(self.config.get("api_url") or DEFAULT_API_URL)
+        tmpl_data = {
+            "rows": cards,
+            "counts": counts,
+            "missing": missing,
+            "filtered": filtered,
+            "checked_at": _fmt_time((data.get("scan") or {}).get("last_finished_at")),
+            "interval": _fmt_duration(interval)
+            if isinstance(interval, (int, float)) and interval > 0
+            else "",
+            "inventory_error": _error_text(inventory_error) if inventory_error else "",
+            "source": urlparse(url).hostname or url,
+        }
+
+        try:
+            path = await self.html_render(
+                TEMPLATE_PATH.read_text(encoding="utf-8"),
+                tmpl_data,
+                return_url=False,
+                options=RENDER_OPTIONS,
+            )
+            with open(path, "rb") as file:
+                head = file.read(8)
+        except Exception as exc:
+            logger.warning(f"[Mirasim] Image render failed: {exc!r}")
+            return None
+        # The T2I client saves any response body, error pages included.
+        if not head.startswith((b"\x89PNG", b"\xff\xd8")):
+            logger.warning(f"[Mirasim] T2I returned a non-image body: {head!r}")
+            return None
+        return path
 
     def _render_model(self, data: dict, query: str) -> str:
         """Render the detail view of one model.
@@ -580,14 +701,8 @@ class MirasimStatus(Star):
                 f"连续可用：{_fmt_duration(model.get('stable_seconds') or 0)}"
                 f"（{_fmt_time(model['current_stable_since'])} 起）"
             )
-        rate = model.get("success_rate_24h")
         samples = model.get("samples_24h") or 0
-        rate_text = (
-            f"{round(rate, 1):g}%"
-            if isinstance(rate, (int, float)) and samples
-            else "—"
-        )
-        lines.append(f"24h 成功率：{rate_text}（{samples} 次采样）")
+        lines.append(f"24h 成功率：{_fmt_rate(model)}（{samples} 次采样）")
         lines.append(f"最近检测：{_fmt_time(model.get('last_checked_at'))}")
         if status != "up" and model.get("last_success_at"):
             lines.append(f"最近成功：{_fmt_time(model['last_success_at'])}")
