@@ -1,0 +1,26 @@
+{
+  "api_url": {
+    "description": "状态接口地址",
+    "type": "string",
+    "hint": "Mirasim 监控站的状态接口，一般无需修改。",
+    "default": "https://mirasim-status.521882.xyz/api/status"
+  },
+  "display_models": {
+    "description": "/mirasim 默认展示的模型",
+    "type": "list",
+    "hint": "填写模型 ID（如 claude-opus-5-5），/mirasim 只展示这些模型；留空则展示全部。任何时候都可以用 /mirasim all 查看全部模型。",
+    "default": []
+  },
+  "poll_interval": {
+    "description": "后台轮询间隔（秒）",
+    "type": "int",
+    "hint": "后台拉取状态、检查订阅模型是否变化的间隔，最小 30 秒。监控站每 5 分钟检测一轮，间隔再短也不会更早发现变化。",
+    "default": 60
+  },
+  "confirm_samples": {
+    "description": "状态变化确认次数",
+    "type": "int",
+    "hint": "模型最近 N 次采样结果一致才算状态变化并推送，用来过滤偶发的单次失败或单次成功。监控站每 5 分钟采样一次，设为 2 时推送最多比实际变化晚约 10 分钟；设为 1 则每次翻转都推送。",
+    "default": 2
+  }
+}
