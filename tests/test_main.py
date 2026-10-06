@@ -504,6 +504,59 @@ class CommandTest(unittest.TestCase):
         self.assertIn("未找到：gpt-9", text)
         self.assertIn("/mirasim all", text)
 
+    def test_configured_model_with_cohort_suffix_shows_only_that_cohort(self):
+        self.plugin.config["display_models"] = ["claude-opus-5-5@paid", "kimi-k3"]
+        text = run(command(self.plugin))
+        lines = text.splitlines()
+        # claude-opus-5-5 narrowed to paid only.
+        opus_idx = next(
+            i for i, line in enumerate(lines) if line.startswith("· claude-opus-5-5")
+        )
+        kimi_idx = next(
+            i for i, line in enumerate(lines) if line.startswith("· kimi-k3")
+        )
+        opus_section = lines[opus_idx + 1 : kimi_idx]
+        opus_cohort_lines = [
+            line
+            for line in opus_section
+            if line.startswith(("  ✅", "  ⚠️", "  ❌", "  ❔"))
+        ]
+        self.assertEqual(len(opus_cohort_lines), 1)
+        self.assertIn("❌ 付费 · 0% · p50 —", opus_cohort_lines[0])
+        # kimi-k3 keeps all three cohorts; the section ends at the trailing footer.
+        kimi_section = "\n".join(lines[kimi_idx:])
+        # Header lines should appear 1×; per-cohort rows 3× (free, paid, cloud).
+        for label in ("免费", "付费", "云端"):
+            cohort_row = next(
+                line for line in lines[kimi_idx:] if f"  ✅ {label} ·" in line
+            )
+            self.assertIn("100%", cohort_row)
+        self.assertEqual(kimi_section.count("  ✅"), 3)
+
+    def test_configured_unknown_cohort_goes_to_missing(self):
+        self.plugin.config["display_models"] = ["kimi-k3@bogus", "kimi-k3@paid"]
+        text = run(command(self.plugin))
+        self.assertIn("未找到：kimi-k3@bogus", text)
+        # The valid entry narrows kimi-k3 to paid only.
+        self.assertIn("  ✅ 付费 ·", text)
+        self.assertNotIn("  ✅ 免费 ·", text)
+        self.assertNotIn("  ✅ 云端 ·", text)
+
+    def test_configured_bare_model_broadens_after_cohort_suffix(self):
+        # Listing both forms for the same model: bare wins (shows all cohorts).
+        self.plugin.config["display_models"] = ["kimi-k3@paid", "kimi-k3"]
+        text = run(command(self.plugin))
+        self.assertIn("  ✅ 免费 ·", text)
+        self.assertIn("  ✅ 付费 ·", text)
+        self.assertIn("  ✅ 云端 ·", text)
+
+    def test_configured_multiple_cohorts_stack(self):
+        self.plugin.config["display_models"] = ["kimi-k3@paid", "kimi-k3@free"]
+        text = run(command(self.plugin))
+        self.assertIn("  ✅ 免费 ·", text)
+        self.assertIn("  ✅ 付费 ·", text)
+        self.assertNotIn("  ✅ 云端 ·", text)
+
     def test_detail_view_default_shows_all_cohorts(self):
         text = run(command(self.plugin, "claude-opus-5-5"))
         self.assertTrue(text.startswith("· claude-opus-5-5"))

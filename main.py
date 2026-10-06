@@ -715,6 +715,10 @@ class MirasimStatus(Star):
     ]:
         """Pick, filter and sort the models shown in the overview.
 
+        Each ``display_models`` entry is either a plain model ID (shows every
+        cohort) or ``model@cohort`` (shows only that cohort). Plain IDs and
+        cohort-suffixed IDs may be mixed freely.
+
         Args:
             data: Status payload.
             show_all: Ignore the ``display_models`` setting.
@@ -731,24 +735,50 @@ class MirasimStatus(Star):
         ]
         filtered = bool(configured) and not show_all
         missing: list[str] = []
-        chosen: list[str] = []
+        # chosen maps model_id -> set of cohort_ids, or None meaning every cohort.
+        chosen: dict[str, set[str] | None] = {}
         if filtered:
             lowered = {k.lower(): k for k in all_models}
-            for model_id in dict.fromkeys(configured):
-                if model_id.lower() in lowered:
-                    chosen.append(lowered[model_id.lower()])
+            for raw in configured:
+                model_part, cohort_part = _split_target(raw)
+                if not model_part:
+                    continue
+                key = lowered.get(model_part.lower())
+                if key is None:
+                    missing.append(raw)
+                    continue
+                # Already chose this model with no cohort filter: nothing changes.
+                if chosen.get(key) is None and key in chosen:
+                    continue
+                if cohort_part is None:
+                    # Broaden (or re-broaden) to all cohorts.
+                    chosen[key] = None
+                    continue
+                # Validate the cohort against the payload.
+                available = {c for c, _m, _a in all_models[key]}
+                if cohort_part not in available:
+                    missing.append(raw)
+                    continue
+                # Accumulate cohorts under this model.
+                bucket = chosen.get(key)
+                if bucket is None:
+                    chosen[key] = {cohort_part}
                 else:
-                    missing.append(model_id)
+                    bucket.add(cohort_part)
         else:
-            chosen = list(all_models)
+            chosen = dict.fromkeys(all_models)
 
         rows: list[tuple[str, list[tuple[str, tuple[str, dict, dict]]], str, str]] = []
-        for model_id in chosen:
+        for model_id, cohort_filter in chosen.items():
             entries = all_models[model_id]
+            if cohort_filter is not None:
+                entries = [e for e in entries if e[0] in cohort_filter]
             tagged = [
                 (_now_status_of(model)[0], (cohort_id, model, agent))
                 for cohort_id, model, agent in entries
             ]
+            if not tagged:
+                continue
             worst = _worst_status([status for status, _e in tagged])
             agent_name = entries[0][2].get("name") or ""
             rows.append((model_id, tagged, agent_name, worst))

@@ -71,7 +71,7 @@ Mirasim 状态变化
 | --- | --- | --- |
 | `api_url` | 状态接口地址 | `https://mirasim.ai/api/status` |
 | `render_image` | 状态概览以图片发送，失败时自动回退文字 | `true` |
-| `display_models` | `/mirasim` 默认展示的模型 ID，留空展示全部；找不到的 ID 会在回复末尾列出 | 空 |
+| `display_models` | `/mirasim` 默认展示的模型，每项可写：<br>· 模型 ID（如 `claude-opus-5-5`）— 显示该模型的全部 3 个池<br>· `模型@池`（如 `claude-opus-5-5@paid`）— 只显示指定池<br>两种形式可混合，对同一模型给出多条 `@池` 会堆叠显示这几个池。找不到的项会在回复末尾列出。留空则展示全部。 | 空 |
 | `poll_interval` | 后台轮询间隔（秒），最小 60 | `60` |
 | `confirm_samples` | 状态变化确认次数，设为 1 则每次翻转都推送 | `2` |
 
