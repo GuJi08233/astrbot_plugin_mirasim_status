@@ -12,9 +12,10 @@
 :root {
   --bg: #191b1a; --surface: #212421; --line: #3a403b;
   --ink: #eeeadd; --muted: #aeb3a8; --faint: #818b81;
-  --up: #8ad0be; --up-bg: #263d35;
+  --ok: #8ad0be; --ok-bg: #263d35;
   --down: #f2a09a; --down-bg: #422d2b;
-  --amber: #dec38c; --amber-bg: #3c3528;
+  --warn: #dec38c; --warn-bg: #3c3528;
+  --nodata: #818b81;
   --mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -29,84 +30,107 @@ body {
 h1 { font-size: 22px; font-weight: 600; letter-spacing: .015em; margin-top: 6px; }
 .subtitle { color: var(--muted); font-size: 13px; margin-top: 4px; }
 .totals {
-  display: flex; gap: 24px; margin-top: 16px; padding: 12px 0;
+  display: flex; gap: 22px; margin-top: 16px; padding: 12px 0;
   border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
 }
 .totals div { display: flex; align-items: baseline; gap: 8px; }
 .totals dt { color: var(--muted); font-size: 12px; }
 .totals dd { font: 600 20px/1.3 var(--mono); }
-.up-text { color: var(--up); }
+.ok-text { color: var(--ok); }
 .down-text { color: var(--down); }
-.amber-text { color: var(--amber); }
-.notice {
-  margin-top: 14px; padding: 9px 12px; font-size: 12px;
-  background: var(--amber-bg); color: var(--amber); border: 1px solid #65573b;
-}
+.warn-text { color: var(--warn); }
+.group { margin-top: 18px; }
+.group-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.group-name { font: 600 14px/1.4 var(--mono); }
+.group-agent { font-size: 12px; color: var(--muted); }
+.group-worst { font-size: 12px; }
+.group-worst.ok { color: var(--ok); }
+.group-worst.warn { color: var(--warn); }
+.group-worst.down { color: var(--down); }
 .list {
-  margin-top: 14px; background: var(--surface);
+  background: var(--surface);
   border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
 }
-.row { padding: 11px 14px 12px; border-top: 1px solid var(--line); }
+.row { padding: 10px 14px 11px; border-top: 1px solid var(--line); }
 .row:first-child { border-top: 0; }
 .line { display: flex; align-items: center; gap: 10px; }
 .line + .line { margin-top: 6px; }
-.name { flex: 1; min-width: 0; font: 500 15px/1.45 var(--mono); overflow-wrap: anywhere; }
+.cohort {
+  flex: 0 0 36px; font: 600 12px/1.45 var(--mono); color: var(--muted);
+  text-transform: uppercase; letter-spacing: .08em;
+}
 .metrics { font: 13px/1.45 var(--mono); color: var(--muted); white-space: nowrap; }
 .badge {
   display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
   padding: 2px 7px; border-radius: 3px; font-size: 12px; white-space: nowrap;
 }
 .badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
-.badge.up { background: var(--up-bg); color: var(--up); }
+.badge.ok { background: var(--ok-bg); color: var(--ok); }
 .badge.down { background: var(--down-bg); color: var(--down); }
-.badge.stale, .badge.unknown { background: var(--amber-bg); color: var(--amber); }
-.note { flex: 1; min-width: 0; font-size: 13px; color: var(--muted); }
+.badge.warn { background: var(--warn-bg); color: var(--warn); }
+.badge.nodata, .badge.unknown { background: transparent; color: var(--nodata); border: 1px dashed var(--line); }
+.note { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); }
 .note.down { color: var(--down); }
-.note.stale, .note.unknown { color: var(--amber); }
+.note.warn { color: var(--warn); }
+.note.nodata, .note.unknown { color: var(--nodata); }
 .history {
-  flex: 0 0 210px; display: grid; grid-template-columns: repeat(60, minmax(0, 1fr));
-  gap: 1px; height: 14px; align-items: end;
+  flex: 0 0 200px; display: grid; grid-template-columns: repeat(48, minmax(0, 1fr));
+  gap: 1px; height: 12px; align-items: end;
 }
-.history i { display: block; height: 14px; background: var(--up); border-radius: 1px; }
-.history i.down { height: 8px; background: var(--down); }
+.history i { display: block; height: 12px; background: var(--ok); border-radius: 1px; }
+.history i.warn { background: var(--warn); }
+.history i.down { background: var(--down); }
+.history i.unknown { background: var(--faint); opacity: .35; }
 .empty { color: var(--muted); text-align: center; padding: 28px 14px; }
 .footer {
   display: flex; justify-content: space-between; gap: 12px;
-  margin-top: 12px; color: var(--faint); font-size: 12px;
+  margin-top: 14px; color: var(--faint); font-size: 12px;
 }
-.missing { margin-top: 6px; color: var(--amber); font-size: 12px; }
+.missing { margin-top: 6px; color: var(--warn); font-size: 12px; }
 </style>
 </head>
 <body>
   <p class="eyebrow">MIRASIM / AVAILABILITY MONITOR</p>
   <h1>Mirasim 模型状态</h1>
-  <p class="subtitle">检测于 {{ checked_at | e }}{% if interval %} · 每 {{ interval | e }}一轮{% endif %}</p>
+  <p class="subtitle">检测于 {{ checked_at | e }}{% if interval %} · 每 {{ interval | e }}一格{% endif %} · 数据源 mirasim.ai</p>
   <dl class="totals">
-    <div><dt>可用</dt><dd class="up-text">{{ counts.up }}</dd></div>
-    <div><dt>失败</dt><dd class="down-text">{{ counts.down }}</dd></div>
-    <div><dt>已过期</dt><dd class="amber-text">{{ counts.stale }}</dd></div>
-    <div><dt>待检测</dt><dd>{{ counts.unknown }}</dd></div>
+    <div><dt>正常</dt><dd class="ok-text">{{ counts.get("ok", 0) }}</dd></div>
+    <div><dt>不稳定</dt><dd class="warn-text">{{ counts.get("warn", 0) }}</dd></div>
+    <div><dt>中断</dt><dd class="down-text">{{ counts.get("down", 0) }}</dd></div>
+    <div><dt>无数据</dt><dd>{{ counts.get("nodata", 0) }}</dd></div>
+    <div><dt>合计</dt><dd>{{ total_rows }}</dd></div>
   </dl>
-  {% if inventory_error %}<p class="notice">模型目录更新失败：{{ inventory_error | e }}</p>{% endif %}
-  <div class="list">
-    {% for row in rows %}
-    <div class="row">
-      <div class="line">
-        <span class="name">{{ row.id | e }}</span>
-        <span class="metrics">{{ row.metrics | e }}</span>
-        <span class="badge {{ row.status }}">{{ row.label | e }}</span>
-      </div>
-      <div class="line">
-        <span class="note {{ row.status }}">{{ row.note | e }}</span>
-        <span class="history">{% for sample in row.history %}<i class="{{ sample }}" style="grid-column: {{ 61 - row.history | length + loop.index0 }}"></i>{% endfor %}</span>
-      </div>
+  {% for group in groups %}
+  <div class="group">
+    <div class="group-head">
+      <span class="group-name">{{ group.id | e }}</span>
+      {% if group.agent %}<span class="group-agent">{{ group.agent | e }}</span>{% endif %}
+      <span class="group-worst {{ group.worst }}">●</span>
     </div>
-    {% else %}
-    <div class="empty">暂无模型数据</div>
-    {% endfor %}
+    <div class="list">
+      {% for card in group.cards %}
+      <div class="row">
+        <div class="line">
+          <span class="cohort">{{ card.cohort_label | e }}</span>
+          <span class="metrics">{{ card.metrics | e }}</span>
+          <span class="badge {{ card.status }}">{{ card.label | e }}</span>
+        </div>
+        <div class="line">
+          <span class="note {{ card.status }}">{{ card.note | e }}</span>
+          <span class="history">
+            {%- set offset = 48 - card.history | length -%}
+            {% for state in card.history %}<i class="{{ state }}" style="grid-column: {{ offset + loop.index0 + 1 }}"></i>{% endfor %}
+          </span>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
   </div>
+  {% else %}
+  <div class="list" style="margin-top:14px;"><div class="empty">暂无模型数据</div></div>
+  {% endfor %}
   <div class="footer">
-    <span>{% if filtered %}仅展示配置的模型 · /mirasim all 查看全部{% else %}右侧为最近 60 次采样，旧 → 新{% endif %}</span>
+    <span>{% if filtered %}仅展示配置的模型 · /mirasim all 查看全部{% else %}右侧为最近 24 小时 48 格，旧 → 新{% endif %}</span>
     <span>{{ source | e }}</span>
   </div>
   {% if missing %}<p class="missing">未找到：{{ missing | join("、") | e }}</p>{% endif %}

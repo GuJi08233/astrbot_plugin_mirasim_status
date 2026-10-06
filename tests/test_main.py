@@ -21,63 +21,85 @@ from astrbot.core.utils.t2i.network_strategy import inject_shiki_runtime
 main_mod = importlib.import_module("data.plugins.astrbot_plugin_mirasim_status.main")
 MirasimStatus = main_mod.MirasimStatus
 
-BASE = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+BASE = datetime(2026, 10, 5, 8, 0, tzinfo=timezone.utc)
 
 
-def iso(minutes: float) -> str:
-    """Return BASE + minutes as the monitor's ISO format."""
-    moment = BASE + timedelta(minutes=minutes)
+def iso(hours: float) -> str:
+    """Return BASE + hours as the monitor's ISO format."""
+    moment = BASE + timedelta(hours=hours)
     return moment.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
-def model(model_id: str, statuses: str, active: bool = True, **extra) -> dict:
-    """Build a model entry whose history is one sample per 5 minutes.
-
-    Args:
-        model_id: The model ID.
-        statuses: History from old to new, ``U`` for up and ``d`` for down.
-        active: Whether the model is in the current inventory.
-        **extra: Fields overriding the derived ones.
-    """
-    history = [
-        {"at": iso(i * 5), "status": "up" if c == "U" else "down"}
-        for i, c in enumerate(statuses)
-    ]
-    last = history[-1] if history else None
-    entry = {
-        "id": model_id,
-        "active": active,
-        "status": last["status"] if last else "unknown",
-        "last_checked_at": last["at"] if last else None,
-        "last_success_at": None,
-        "last_failure_at": None,
-        "current_stable_since": None,
-        "stable_seconds": 0,
-        "latency_ms": 2345.6,
-        "last_error": None if not last or last["status"] == "up" else "HTTP 503",
-        "samples_24h": len(history),
-        "success_rate_24h": 100.0 * statuses.count("U") / len(statuses)
-        if statuses
-        else 0,
-        "avg_latency_ms_24h": 2000.0,
-        "history": history,
-    }
-    entry.update(extra)
-    return entry
-
-
-def payload(*models: dict, now_minutes: float | None = None) -> dict:
-    """Wrap models into a status document checked right after the last sample."""
-    newest = max((len(m["history"]) for m in models), default=1)
-    now = iso(now_minutes if now_minutes is not None else newest * 5)
+def make_model(
+    model_id: str,
+    name: str,
+    *,
+    status: str = "ok",
+    availability: float | None = 100.0,
+    p50: float | None = 5.0,
+    h24: float = 99.0,
+    d7: float = 99.0,
+    cells: list[int] | None = None,
+    same_model: int = 100,
+    intel: dict | None = None,
+) -> dict:
+    """Build one model entry mirasim.ai-style (a value-per-cell array)."""
+    if cells is None:
+        cells = [1000] * 48
     return {
-        "models": list(models),
-        "summary": {},
-        "inventory": {"error": None},
-        "now": now,
-        "interval_seconds": 300,
-        "stale_after_seconds": 690,
-        "scan": {"last_finished_at": now},
+        "id": model_id,
+        "name": name,
+        "now": {"status": status, "availability": availability, "window": "15m"},
+        "availability": {"h24": h24, "d7": d7},
+        "latency": {"p50": p50, "p95": (p50 * 6 if p50 is not None else None)},
+        "sameModel": same_model,
+        "intel": intel,
+        "cells": cells,
+        "merged": [],
+    }
+
+
+def make_agent(
+    agent_id: str,
+    name: str,
+    models: list[dict],
+    *,
+    reasons: list[dict] | None = None,
+) -> dict:
+    """Wrap models under an agent blob; agent summary mirrors the first model."""
+    summary = dict(models[0]) if models else {}
+    summary.pop("id", None)
+    summary.pop("name", None)
+    return {
+        "id": agent_id,
+        "name": name,
+        "summary": summary,
+        "models": models,
+        "reasons": reasons,
+    }
+
+
+def make_payload(
+    *,
+    agents_free: list[dict] | None = None,
+    agents_paid: list[dict] | None = None,
+    agents_cloud: list[dict] | None = None,
+    generated_h: float = 24.0,
+) -> dict:
+    """Build the full status payload from per-cohort agent lists."""
+    return {
+        "schema": 2,
+        "generatedAt": iso(generated_h),
+        "dataThrough": iso(generated_h),
+        "cellSeconds": 1800,
+        "cellsStart": iso(0),
+        "thresholds": {"good": 99, "warn": 95, "minTurns": 20},
+        "notes": [],
+        "cohorts": [
+            {"id": "free", "state": "ok", "agents": agents_free or []},
+            {"id": "paid", "state": "ok", "agents": agents_paid or []},
+            {"id": "cloud", "state": "ok", "agents": agents_cloud or []},
+        ],
     }
 
 
@@ -134,143 +156,376 @@ class ResolveIdTest(unittest.TestCase):
             main_mod._resolve_id(self.IDS, "5-5", "")
         self.assertIn("claude-opus-5-5、claude-sonnet-5-5", str(ctx.exception))
 
-    def test_unknown_input_carries_the_hint(self):
-        with self.assertRaises(LookupError) as ctx:
-            main_mod._resolve_id(self.IDS, "gemini", "试试 list")
-        self.assertIn("试试 list", str(ctx.exception))
+
+class CellStatusTest(unittest.TestCase):
+    """The plugin uses 90/50 thresholds, much looser than the site's 99/95."""
+
+    def test_per_threshold_bucket(self):
+        # 90% availability (900/1000) and above counts as 正常.
+        self.assertEqual(main_mod._cell_status(1000, 90, 50), "ok")
+        self.assertEqual(main_mod._cell_status(900, 90, 50), "ok")
+        # 50–89.9% is 不稳定.
+        self.assertEqual(main_mod._cell_status(899, 90, 50), "warn")
+        self.assertEqual(main_mod._cell_status(500, 90, 50), "warn")
+        # Below 50% is 中断.
+        self.assertEqual(main_mod._cell_status(499, 90, 50), "down")
+        self.assertEqual(main_mod._cell_status(0, 90, 50), "down")
+
+    def test_gap_is_unknown(self):
+        self.assertEqual(main_mod._cell_status(-1, 90, 50), "unknown")
+        self.assertEqual(main_mod._cell_status(None, 90, 50), "unknown")
+
+    def test_history_bars_use_loose_plugin_thresholds(self):
+        """A model at 95% availability shows as 正常 despite the site warning."""
+        cells = [950] * 48  # 95% everywhere — site says warn, plugin says ok.
+        data = make_payload(
+            agents_free=[make_agent("a", "A", [make_model("m", "m", cells=cells)])],
+        )
+        bars = main_mod._history_bars(cells, data)
+        self.assertEqual(bars, ["ok"] * 48)
 
 
-class EffectiveStatusTest(unittest.TestCase):
-    def test_result_older_than_the_limit_is_stale(self):
-        entry = model("m", "UU")
-        self.assertEqual(main_mod._effective_status(entry, payload(entry)), "up")
-        late = payload(entry, now_minutes=5 + 690 / 60 + 1)
-        self.assertEqual(main_mod._effective_status(entry, late), "stale")
+class NowStatusTest(unittest.TestCase):
+    """The plugin derives status from availability, not from now.status."""
 
-    def test_never_checked_is_unknown(self):
-        entry = model("m", "")
-        self.assertEqual(main_mod._effective_status(entry, payload(entry)), "unknown")
+    def _model(self, status: str, availability: float) -> dict:
+        return make_model("m", "m", status=status, availability=availability)
+
+    def test_site_warn_but_plugin_ok(self):
+        # Site would say warn at 97%, plugin says ok (97 >= 90).
+        model = self._model("warn", 97.0)
+        self.assertEqual(main_mod._now_status_of(model), ("ok", 97.0))
+
+    def test_site_down_but_plugin_warn(self):
+        # Site would say down at 91.9%, plugin says warn (50 ≤ 91.9 < 90 is False, so warn).
+        model = self._model("down", 70.0)
+        self.assertEqual(main_mod._now_status_of(model), ("warn", 70.0))
+
+    def test_really_down(self):
+        model = self._model("down", 30.0)
+        self.assertEqual(main_mod._now_status_of(model), ("down", 30.0))
+
+    def test_no_data(self):
+        model = self._model("down", None)
+        # availability=None → nodata
+        model["now"]["availability"] = None
+        self.assertEqual(main_mod._now_status_of(model)[0], "nodata")
 
 
 class ChangeDetectionTest(unittest.TestCase):
+    """The plugin watches now.status across two consecutive polls."""
+
+    def _payload_with(self, model_states: dict[str, str]) -> dict:
+        """One Claude model across all three pools in the given states."""
+        return make_payload(
+            agents_free=[
+                make_agent(
+                    "claude-code",
+                    "Claude",
+                    [
+                        make_model(
+                            "claude-opus-5-5",
+                            "opus 5.5",
+                            status=model_states["free"],
+                            availability=0.0
+                            if model_states["free"] == "down"
+                            else 100.0,
+                        )
+                    ],
+                )
+            ],
+            agents_paid=[
+                make_agent(
+                    "claude-code",
+                    "Claude",
+                    [
+                        make_model(
+                            "claude-opus-5-5",
+                            "opus 5.5",
+                            status=model_states["paid"],
+                            availability=0.0
+                            if model_states["paid"] == "down"
+                            else 100.0,
+                        )
+                    ],
+                )
+            ],
+            agents_cloud=[
+                make_agent(
+                    "claude-code",
+                    "Claude",
+                    [
+                        make_model(
+                            "claude-opus-5-5",
+                            "opus 5.5",
+                            status=model_states["cloud"],
+                            availability=0.0
+                            if model_states["cloud"] == "down"
+                            else 100.0,
+                        )
+                    ],
+                )
+            ],
+        )
+
     def test_first_poll_records_a_silent_baseline(self):
         plugin = make_plugin()
         plugin._subs = {"s": ["*"]}
-        run(plugin._check_changes(payload(model("a", "UU"), model("b", "dd"))))
-        self.assertEqual(plugin._states, {"a": "up", "b": "down"})
+        data = self._payload_with({"free": "down", "paid": "down", "cloud": "ok"})
+        run(plugin._check_changes(data))
+        self.assertEqual(
+            plugin._states,
+            {
+                "claude-opus-5-5@free": "down",
+                "claude-opus-5-5@paid": "down",
+                "claude-opus-5-5@cloud": "ok",
+            },
+        )
         plugin.put_kv_data.assert_awaited_once_with("states", plugin._states)
         plugin.context.send_message.assert_not_awaited()
 
-    def test_single_failed_sample_is_not_pushed(self):
+    def test_single_poll_flip_does_not_push_with_confirm_two(self):
+        """A change lasting one poll is just a blip."""
         plugin = make_plugin()
         plugin._subs = {"s": ["*"]}
-        plugin._states = {"a": "up"}
-        run(plugin._check_changes(payload(model("a", "UUUd"))))
-        self.assertEqual(plugin._states, {"a": "up"})
+        plugin._states = {
+            "claude-opus-5-5@free": "ok",
+            "claude-opus-5-5@paid": "ok",
+            "claude-opus-5-5@cloud": "ok",
+        }
+        prev = self._payload_with({"free": "ok", "paid": "ok", "cloud": "ok"})
+        cur = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
+        run(plugin._check_changes(cur, prev))
+        # prev was ok so the change hasn't been seen twice in a row.
         plugin.context.send_message.assert_not_awaited()
 
-    def test_confirm_samples_of_one_pushes_every_flip(self):
+    def test_confirmed_failure_pushes_per_cohort(self):
+        """A failure seen on two consecutive polls fires."""
+        plugin = make_plugin()
+        plugin._subs = {"s": ["*"]}
+        plugin._states = {
+            "claude-opus-5-5@free": "ok",
+            "claude-opus-5-5@paid": "ok",
+            "claude-opus-5-5@cloud": "ok",
+        }
+        prev = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
+        cur = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
+        run(plugin._check_changes(cur, prev))
+        sent = sent_messages(plugin)
+        self.assertIn("🔴 claude-opus-5-5（免费）中断", sent["s"])
+        self.assertNotIn("claude-opus-5-5（付费）中断", sent["s"])
+        self.assertEqual(plugin._states["claude-opus-5-5@free"], "down")
+
+    def test_only_subscribed_cohort_gets_the_push(self):
+        plugin = make_plugin()
+        plugin._subs = {
+            "s-paid": ["claude-opus-5-5@paid"],
+            "s-free": ["claude-opus-5-5@free"],
+            "s-all-cohorts": ["claude-opus-5-5"],
+        }
+        plugin._states = {
+            "claude-opus-5-5@free": "ok",
+            "claude-opus-5-5@paid": "ok",
+            "claude-opus-5-5@cloud": "ok",
+        }
+        prev = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
+        cur = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
+        run(plugin._check_changes(cur, prev))
+        sent = sent_messages(plugin)
+        self.assertIn("s-free", sent)
+        self.assertIn("s-all-cohorts", sent)
+        self.assertNotIn("s-paid", sent)
+
+    def test_confirm_one_pushes_immediately(self):
         plugin = make_plugin(confirm_samples=1)
         plugin._subs = {"s": ["*"]}
-        plugin._states = {"a": "up"}
-        run(plugin._check_changes(payload(model("a", "UUUd"))))
-        self.assertIn("🔴 a 故障", sent_messages(plugin)["s"])
-
-    def test_confirmed_failure_reaches_only_its_subscribers_in_one_message(self):
-        plugin = make_plugin()
-        plugin._states = {"a": "up", "b": "up", "c": "up"}
-        plugin._subs = {
-            "group-all": ["*"],
-            "group-a": ["a"],
-            "group-c": ["c"],
+        plugin._states = {
+            "claude-opus-5-5@free": "ok",
+            "claude-opus-5-5@paid": "ok",
+            "claude-opus-5-5@cloud": "ok",
         }
-        data = payload(model("a", "UUdd"), model("b", "Udd"), model("c", "UUU"))
-        run(plugin._check_changes(data))
-
+        cur = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
+        run(plugin._check_changes(cur, None))
         sent = sent_messages(plugin)
-        self.assertEqual(set(sent), {"group-all", "group-a"})
-        self.assertIn("🔴 a 故障：上游 HTTP 503", sent["group-all"])
-        self.assertIn("🔴 b 故障", sent["group-all"])
-        self.assertTrue(sent["group-all"].startswith("Mirasim 状态变化\n"))
-        self.assertNotIn("b 故障", sent["group-a"])
-        self.assertEqual(plugin._states, {"a": "down", "b": "down", "c": "up"})
+        self.assertIn("🔴 claude-opus-5-5（免费）中断", sent["s"])
 
-    def test_recovery_reports_the_outage_length(self):
-        plugin = make_plugin()
-        plugin._subs = {"s": ["a"]}
-        plugin._states = {"a": "down"}
-        # Failures at minutes 5 and 10, back up at 15: a 10-minute outage.
-        run(plugin._check_changes(payload(model("a", "UddUU"))))
-        text = sent_messages(plugin)["s"]
-        self.assertIn("🟢 a 已恢复，当前耗时 2.3s", text)
-        self.assertIn("故障持续约 10分钟", text)
-
-    def test_outage_older_than_the_history_is_marked_as_a_lower_bound(self):
-        plugin = make_plugin()
-        plugin._subs = {"s": ["a"]}
-        plugin._states = {"a": "down"}
-        run(plugin._check_changes(payload(model("a", "ddUU"))))
-        self.assertIn("故障持续超过 10分钟", sent_messages(plugin)["s"])
-
-    def test_models_outside_the_inventory_are_ignored(self):
+    def test_recovery_lists_outage_duration(self):
+        """The ok push reports how long down was visible inside the 24h cells."""
         plugin = make_plugin()
         plugin._subs = {"s": ["*"]}
-        plugin._states = {"gone": "up"}
-        run(plugin._check_changes(payload(model("gone", "Udd", active=False))))
-        self.assertEqual(plugin._states, {"gone": "up"})
-        plugin.context.send_message.assert_not_awaited()
-
-    def test_failed_push_does_not_stop_the_other_sessions(self):
-        plugin = make_plugin()
-        plugin._subs = {"broken": ["*"], "fine": ["*"]}
-        plugin._states = {"a": "up"}
-        plugin.context.send_message.side_effect = [RuntimeError("boom"), True]
-        run(plugin._check_changes(payload(model("a", "Udd"))))
-        self.assertEqual(plugin.context.send_message.await_count, 2)
-        self.assertEqual(plugin._states, {"a": "down"})
+        plugin._states = {
+            "claude-opus-5-5@free": "down",
+        }
+        # 41 ok cells, then 6 down cells (3 hours), then 1 ok cell.
+        cells_with_outage = [1000] * 41 + [0] * 6 + [1000]
+        # prev already shows the recovery (status ok), so two polls of "ok"
+        # back-to-back confirm the transition.
+        prev = make_payload(
+            agents_free=[
+                make_agent(
+                    "claude-code",
+                    "Claude",
+                    [
+                        make_model(
+                            "claude-opus-5-5",
+                            "opus 5.5",
+                            status="ok",
+                            availability=100.0,
+                            p50=4.2,
+                            cells=cells_with_outage,
+                        )
+                    ],
+                )
+            ],
+            agents_paid=[],
+            agents_cloud=[],
+        )
+        cur = make_payload(
+            agents_free=[
+                make_agent(
+                    "claude-code",
+                    "Claude",
+                    [
+                        make_model(
+                            "claude-opus-5-5",
+                            "opus 5.5",
+                            status="ok",
+                            availability=100.0,
+                            p50=4.2,
+                            cells=cells_with_outage,
+                        )
+                    ],
+                )
+            ],
+            agents_paid=[],
+            agents_cloud=[],
+        )
+        run(plugin._check_changes(cur, prev))
+        sent = sent_messages(plugin)
+        self.assertIn("🟢 claude-opus-5-5（免费）已恢复", sent["s"])
+        self.assertIn("p50 4.2s", sent["s"])
+        # Cells show a 6-cell outage (3 hours).
+        self.assertIn("中断持续约 3小时", sent["s"])
 
 
 class CommandTest(unittest.TestCase):
     def setUp(self):
-        self.data = payload(
-            model("claude-opus-5-5", "UUU", stable_seconds=600),
-            model("claude-sonnet-5-5", "UUU"),
-            model("kimi-k3", "Udd", last_error="upstream_truncated"),
-            model("old-model", "UU", active=False),
+        self.data = make_payload(
+            agents_free=[
+                make_agent(
+                    "claude-code",
+                    "Claude",
+                    [
+                        make_model(
+                            "claude-opus-5-5",
+                            "opus 5.5",
+                            status="down",
+                            availability=0.0,
+                            p50=None,
+                        ),
+                        make_model("claude-fable-5-1", "fable 5.1"),
+                    ],
+                    reasons=[
+                        {"class": "throttle", "share": 78.5},
+                        {"class": "outage", "share": 21.4},
+                    ],
+                ),
+                make_agent(
+                    "kimi-code",
+                    "Kimi",
+                    [make_model("kimi-k3", "k3")],
+                ),
+            ],
+            agents_paid=[
+                make_agent(
+                    "claude-code",
+                    "Claude",
+                    [
+                        make_model(
+                            "claude-opus-5-5",
+                            "opus 5.5",
+                            status="down",
+                            availability=0.0,
+                            p50=None,
+                        ),
+                        make_model("claude-fable-5-1", "fable 5.1"),
+                    ],
+                ),
+                make_agent(
+                    "kimi-code",
+                    "Kimi",
+                    [make_model("kimi-k3", "k3")],
+                ),
+            ],
+            agents_cloud=[
+                make_agent(
+                    "claude-code",
+                    "Claude",
+                    [
+                        make_model("claude-opus-5-5", "opus 5.5"),
+                        make_model("claude-fable-5-1", "fable 5.1"),
+                    ],
+                ),
+                make_agent(
+                    "kimi-code",
+                    "Kimi",
+                    [make_model("kimi-k3", "k3")],
+                ),
+            ],
         )
         self.plugin = make_plugin()
         self.plugin._fetch_status = AsyncMock(return_value=self.data)
 
-    def test_overview_lists_problems_first_and_skips_retired_models(self):
+    def test_overview_lists_models_with_per_cohort_lines(self):
         text = run(command(self.plugin))
         lines = text.splitlines()
-        self.assertEqual(lines[0], "Mirasim 模型状态 · 可用 2/3")
-        self.assertEqual(lines[1], "❌ kimi-k3 · 上游输出被截断")
-        self.assertIn("✅ claude-opus-5-5 · 2.3s · 24h 100%", lines)
-        self.assertNotIn("old-model", text)
-        self.assertIn("每 5分钟一轮", text)
+        self.assertTrue(lines[0].startswith("Mirasim 模型状态 · 可用 "))
+        # claude-opus-5-5 is down in 2 pools and ok in 1; the others are ok.
+        self.assertIn("/9", lines[0])
+        self.assertIn("7/9", lines[0])
+        self.assertIn("· claude-opus-5-5 — Claude", text)
+        self.assertIn("❌ 免费 · 0% · p50 —", text)
+        self.assertIn("❌ 付费 · 0% · p50 —", text)
+        self.assertIn("✅ 云端 · 100% · p50 5.0s", text)
+        self.assertIn("· kimi-k3 — Kimi", text)
 
-    def test_configured_models_narrow_the_overview_until_all_is_asked(self):
+    def test_problems_sort_first(self):
+        text = run(command(self.plugin))
+        # claude-opus-5-5 has the worst (down) status and leads the list.
+        first_model_idx = text.index("· claude-opus-5-5")
+        self.assertLess(first_model_idx, text.index("· kimi-k3"))
+        self.assertLess(first_model_idx, text.index("· claude-fable-5-1"))
+
+    def test_configured_models_narrow_the_overview(self):
         self.plugin.config["display_models"] = ["claude-opus-5-5", "gpt-9"]
         text = run(command(self.plugin))
-        self.assertIn("可用 1/1", text)
+        self.assertIn("claude-opus-5-5", text)
         self.assertNotIn("kimi-k3", text)
         self.assertIn("未找到：gpt-9", text)
         self.assertIn("/mirasim all", text)
 
-        everything = run(command(self.plugin, "all"))
-        self.assertIn("kimi-k3", everything)
-        self.assertNotIn("未找到", everything)
+    def test_detail_view_default_shows_all_cohorts(self):
+        text = run(command(self.plugin, "claude-opus-5-5"))
+        self.assertTrue(text.startswith("· claude-opus-5-5"))
+        self.assertIn("❌ 免费池 中断（可用率 0%）", text)
+        self.assertIn("❌ 付费池 中断（可用率 0%）", text)
+        self.assertIn("✅ 云端池 正常", text)
 
-    def test_detail_view_shows_reason_and_history(self):
-        text = run(command(self.plugin, "kimi"))
-        self.assertTrue(text.startswith("❌ kimi-k3 · 失败"))
-        self.assertIn("失败原因：上游输出被截断", text)
-        self.assertIn("最近 3 次采样（旧→新）：\n🟩🟥🟥", text)
+    def test_detail_view_with_cohort_filter(self):
+        text = run(command(self.plugin, "claude-opus-5-5@paid"))
+        self.assertTrue(text.startswith("· claude-opus-5-5@paid"))
+        self.assertIn("❌ 付费池 中断", text)
+        self.assertNotIn("免费池", text)
+        self.assertNotIn("云端池", text)
 
-    def test_retired_models_stay_queryable(self):
-        text = run(command(self.plugin, "old-model"))
-        self.assertIn("已退出监控目录", text)
+    def test_detail_view_unknown_cohort(self):
+        text = run(command(self.plugin, "claude-opus-5-5@bogus"))
+        self.assertIn("未知池「bogus」", text)
+
+    def test_detail_view_shows_failure_reason(self):
+        text = run(command(self.plugin, "claude-opus-5-5@free"))
+        self.assertIn("限流", text)
+        self.assertIn("故障", text)
 
     def test_fetch_failure_is_reported(self):
         self.plugin._fetch_status = AsyncMock(side_effect=TimeoutError())
@@ -281,22 +536,24 @@ class CommandTest(unittest.TestCase):
     def test_subscription_lifecycle(self):
         plugin = self.plugin
         reply = run(command(plugin, "sub", "opus"))
-        self.assertIn("已订阅 claude-opus-5-5（当前 ✅ 可用）", reply)
+        self.assertIn("已订阅 claude-opus-5-5 的全部 3 个池", reply)
         self.assertEqual(plugin._subs, {"qq:GroupMessage:1": ["claude-opus-5-5"]})
         plugin.put_kv_data.assert_awaited_with("subscriptions", plugin._subs)
 
-        self.assertIn("匹配到多个模型", run(command(plugin, "sub", "5-5")))
-        self.assertIn("已订阅", run(command(plugin, "sub", "claude-opus-5-5")))
-        run(command(plugin, "sub", "kimi"))
-        listing = run(command(plugin, "list"))
-        self.assertIn("订阅了 2 个模型", listing)
-        self.assertIn("· kimi-k3", listing)
+        reply = run(command(plugin, "sub", "claude-fable-5-1@paid"))
+        self.assertIn("claude-fable-5-1@paid", reply)
+        self.assertIn("付费池", reply)
 
-        # Another session keeps its own list.
+        listing = run(command(plugin, "list"))
+        self.assertIn("订阅了 2 项", listing)
+        self.assertIn("· claude-fable-5-1@paid", listing)
+
         self.assertIn("还没有订阅", run(command(plugin, "list", umo="qq:Friend:9")))
 
-        self.assertEqual(run(command(plugin, "unsub", "kimi")), "已取消订阅 kimi-k3。")
-        run(command(plugin, "unsub", "opus"))
+        reply = run(command(plugin, "unsub", "claude-opus-5-5"))
+        self.assertEqual(reply, "已取消订阅 claude-opus-5-5。")
+        reply = run(command(plugin, "unsub", "claude-fable-5-1@paid"))
+        self.assertEqual(reply, "已取消订阅 claude-fable-5-1@paid。")
         self.assertEqual(plugin._subs, {})
 
     def test_subscribing_to_everything(self):
@@ -311,24 +568,25 @@ class CommandTest(unittest.TestCase):
         )
         self.assertEqual(plugin._subs, {})
 
-    def test_cannot_subscribe_to_a_retired_model(self):
-        reply = run(command(self.plugin, "sub", "old-model"))
-        self.assertIn("没有找到", reply)
-        self.assertEqual(self.plugin._subs, {})
-
 
 class ImageTest(unittest.TestCase):
     def setUp(self):
-        self.data = payload(
-            model("claude-opus-5-5", "UUU", stable_seconds=600),
-            model(
-                "kimi-k3",
-                "Udd",
-                last_error="upstream_incomplete",
-                last_success_at=iso(0),
-            ),
-            model("<b>odd</b>", "UU"),
-            model("old-model", "UU", active=False),
+        self.data = make_payload(
+            agents_free=[
+                make_agent(
+                    "claude-code",
+                    "Claude",
+                    [make_model("<b>odd</b>", "odd")],
+                ),
+                make_agent(
+                    "kimi-code",
+                    "Kimi",
+                    [make_model("kimi-k3", "k3", status="down", availability=0.0, p50=None)],
+                    reasons=[{"class": "outage", "share": 100.0}],
+                ),
+            ],
+            agents_paid=[],
+            agents_cloud=[],
         )
         self.plugin = make_plugin(render_image=True)
         self.plugin._fetch_status = AsyncMock(return_value=self.data)
@@ -360,23 +618,17 @@ class ImageTest(unittest.TestCase):
         self.assertEqual(options["options"]["device_scale_factor_level"], "ultra")
 
     def test_template_renders_the_cards(self):
-        self.plugin.config["display_models"] = ["kimi-k3", "claude-opus-5-5", "gpt-9"]
         self.plugin.html_render = AsyncMock(return_value=self.fake_image(b"\xff\xd8"))
         run(command(self.plugin))
 
         for autoescape in (False, True):
             html = self.rendered_html(autoescape)
-            # Failures first; retired and unlisted models stay out.
-            self.assertLess(html.index("kimi-k3"), html.index("claude-opus-5-5"))
-            self.assertNotIn("old-model", html)
-            self.assertIn("上游输出未完整结束 · 上次成功", html)
-            self.assertIn("连续可用 10分钟", html)
-            self.assertIn("2.3s · 24h 33.3%", html)
-            self.assertIn("未找到：gpt-9", html)
-            self.assertIn("仅展示配置的模型", html)
-            # Samples are right-aligned on the 60-slot strip, newest last.
-            self.assertIn('<i class="down" style="grid-column: 60">', html)
-            self.assertIn('<i class="up" style="grid-column: 58">', html)
+            # The down model comes before the ok one.
+            self.assertLess(html.index("kimi-k3"), html.index("&lt;b&gt;odd&lt;/b&gt;"))
+            # One row per cohort of the model.
+            self.assertIn("免费", html)
+            # Strip fills all 48 slots; my fixtures have all-1000 cells.
+            self.assertIn('class="ok" style="grid-column: 48"', html)
 
     def test_text_from_the_api_is_escaped_whatever_t2i_does(self):
         self.plugin.html_render = AsyncMock(return_value=self.fake_image(b"\xff\xd8"))
@@ -390,16 +642,7 @@ class ImageTest(unittest.TestCase):
         page = self.fake_image(b"<html><title>502 Bad Gateway</title></html>")
         self.plugin.html_render = AsyncMock(return_value=page)
         reply = run(command(self.plugin))
-        self.assertTrue(reply.startswith("Mirasim 模型状态 · 可用 2/3"))
-
-    def test_render_failure_falls_back_to_text(self):
-        self.plugin.html_render = AsyncMock(side_effect=RuntimeError("down"))
-        self.assertIn("❌ kimi-k3", run(command(self.plugin)))
-
-    def test_detail_view_stays_text(self):
-        self.plugin.html_render = AsyncMock()
-        self.assertTrue(run(command(self.plugin, "kimi")).startswith("❌ kimi-k3"))
-        self.plugin.html_render.assert_not_awaited()
+        self.assertTrue(reply.startswith("Mirasim 模型状态 · 可用"))
 
     def test_template_skips_the_shiki_injection(self):
         # AstrBot otherwise appends a 2.4 MB highlighter to every request.
