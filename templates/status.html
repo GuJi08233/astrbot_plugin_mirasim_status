@@ -96,7 +96,7 @@ h1 { font-size: 22px; font-weight: 600; letter-spacing: .015em; margin-top: 6px;
   <dl class="totals">
     <div><dt>正常</dt><dd class="ok-text">{{ counts.get("ok", 0) }}</dd></div>
     <div><dt>不稳定</dt><dd class="warn-text">{{ counts.get("warn", 0) }}</dd></div>
-    <div><dt>中断</dt><dd class="down-text">{{ counts.get("down", 0) }}</dd></div>
+    <div><dt>异常</dt><dd class="down-text">{{ counts.get("down", 0) }}</dd></div>
     <div><dt>无数据</dt><dd>{{ counts.get("nodata", 0) }}</dd></div>
     <div><dt>合计</dt><dd>{{ total_rows }}</dd></div>
   </dl>

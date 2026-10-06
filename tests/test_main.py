@@ -312,8 +312,8 @@ class ChangeDetectionTest(unittest.TestCase):
         cur = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
         run(plugin._check_changes(cur, prev))
         sent = sent_messages(plugin)
-        self.assertIn("🔴 claude-opus-5-5（免费）中断", sent["s"])
-        self.assertNotIn("claude-opus-5-5（付费）中断", sent["s"])
+        self.assertIn("🔴 claude-opus-5-5（体验）异常", sent["s"])
+        self.assertNotIn("claude-opus-5-5（订阅）异常", sent["s"])
         self.assertEqual(plugin._states["claude-opus-5-5@free"], "down")
 
     def test_only_subscribed_cohort_gets_the_push(self):
@@ -347,7 +347,7 @@ class ChangeDetectionTest(unittest.TestCase):
         cur = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
         run(plugin._check_changes(cur, None))
         sent = sent_messages(plugin)
-        self.assertIn("🔴 claude-opus-5-5（免费）中断", sent["s"])
+        self.assertIn("🔴 claude-opus-5-5（体验）异常", sent["s"])
 
     def test_recovery_lists_outage_duration(self):
         """The ok push reports how long down was visible inside the 24h cells."""
@@ -402,10 +402,10 @@ class ChangeDetectionTest(unittest.TestCase):
         )
         run(plugin._check_changes(cur, prev))
         sent = sent_messages(plugin)
-        self.assertIn("🟢 claude-opus-5-5（免费）已恢复", sent["s"])
+        self.assertIn("🟢 claude-opus-5-5（体验）已恢复", sent["s"])
         self.assertIn("p50 4.2s", sent["s"])
         # Cells show a 6-cell outage (3 hours).
-        self.assertIn("中断持续约 3小时", sent["s"])
+        self.assertIn("异常持续约 3小时", sent["s"])
 
 
 class CommandTest(unittest.TestCase):
@@ -484,8 +484,8 @@ class CommandTest(unittest.TestCase):
         self.assertIn("/9", lines[0])
         self.assertIn("7/9", lines[0])
         self.assertIn("· claude-opus-5-5 — Claude", text)
-        self.assertIn("❌ 免费 · 0% · p50 —", text)
-        self.assertIn("❌ 付费 · 0% · p50 —", text)
+        self.assertIn("❌ 体验 · 0% · p50 —", text)
+        self.assertIn("❌ 订阅 · 0% · p50 —", text)
         self.assertIn("✅ 云端 · 100% · p50 5.0s", text)
         self.assertIn("· kimi-k3 — Kimi", text)
 
@@ -522,11 +522,11 @@ class CommandTest(unittest.TestCase):
             if line.startswith(("  ✅", "  ⚠️", "  ❌", "  ❔"))
         ]
         self.assertEqual(len(opus_cohort_lines), 1)
-        self.assertIn("❌ 付费 · 0% · p50 —", opus_cohort_lines[0])
+        self.assertIn("❌ 订阅 · 0% · p50 —", opus_cohort_lines[0])
         # kimi-k3 keeps all three cohorts; the section ends at the trailing footer.
         kimi_section = "\n".join(lines[kimi_idx:])
         # Header lines should appear 1×; per-cohort rows 3× (free, paid, cloud).
-        for label in ("免费", "付费", "云端"):
+        for label in ("体验", "订阅", "云端"):
             cohort_row = next(
                 line for line in lines[kimi_idx:] if f"  ✅ {label} ·" in line
             )
@@ -538,37 +538,37 @@ class CommandTest(unittest.TestCase):
         text = run(command(self.plugin))
         self.assertIn("未找到：kimi-k3@bogus", text)
         # The valid entry narrows kimi-k3 to paid only.
-        self.assertIn("  ✅ 付费 ·", text)
-        self.assertNotIn("  ✅ 免费 ·", text)
+        self.assertIn("  ✅ 订阅 ·", text)
+        self.assertNotIn("  ✅ 体验 ·", text)
         self.assertNotIn("  ✅ 云端 ·", text)
 
     def test_configured_bare_model_broadens_after_cohort_suffix(self):
         # Listing both forms for the same model: bare wins (shows all cohorts).
         self.plugin.config["display_models"] = ["kimi-k3@paid", "kimi-k3"]
         text = run(command(self.plugin))
-        self.assertIn("  ✅ 免费 ·", text)
-        self.assertIn("  ✅ 付费 ·", text)
+        self.assertIn("  ✅ 体验 ·", text)
+        self.assertIn("  ✅ 订阅 ·", text)
         self.assertIn("  ✅ 云端 ·", text)
 
     def test_configured_multiple_cohorts_stack(self):
         self.plugin.config["display_models"] = ["kimi-k3@paid", "kimi-k3@free"]
         text = run(command(self.plugin))
-        self.assertIn("  ✅ 免费 ·", text)
-        self.assertIn("  ✅ 付费 ·", text)
+        self.assertIn("  ✅ 体验 ·", text)
+        self.assertIn("  ✅ 订阅 ·", text)
         self.assertNotIn("  ✅ 云端 ·", text)
 
     def test_detail_view_default_shows_all_cohorts(self):
         text = run(command(self.plugin, "claude-opus-5-5"))
         self.assertTrue(text.startswith("· claude-opus-5-5"))
-        self.assertIn("❌ 免费池 中断（可用率 0%）", text)
-        self.assertIn("❌ 付费池 中断（可用率 0%）", text)
+        self.assertIn("❌ 体验池 异常（可用率 0%）", text)
+        self.assertIn("❌ 订阅池 异常（可用率 0%）", text)
         self.assertIn("✅ 云端池 正常", text)
 
     def test_detail_view_with_cohort_filter(self):
         text = run(command(self.plugin, "claude-opus-5-5@paid"))
         self.assertTrue(text.startswith("· claude-opus-5-5@paid"))
-        self.assertIn("❌ 付费池 中断", text)
-        self.assertNotIn("免费池", text)
+        self.assertIn("❌ 订阅池 异常", text)
+        self.assertNotIn("体验池", text)
         self.assertNotIn("云端池", text)
 
     def test_detail_view_unknown_cohort(self):
@@ -595,7 +595,7 @@ class CommandTest(unittest.TestCase):
 
         reply = run(command(plugin, "sub", "claude-fable-5-1@paid"))
         self.assertIn("claude-fable-5-1@paid", reply)
-        self.assertIn("付费池", reply)
+        self.assertIn("订阅池", reply)
 
         listing = run(command(plugin, "list"))
         self.assertIn("订阅了 2 项", listing)
@@ -679,7 +679,7 @@ class ImageTest(unittest.TestCase):
             # The down model comes before the ok one.
             self.assertLess(html.index("kimi-k3"), html.index("&lt;b&gt;odd&lt;/b&gt;"))
             # One row per cohort of the model.
-            self.assertIn("免费", html)
+            self.assertIn("体验", html)
             # Strip fills all 48 slots; my fixtures have all-1000 cells.
             self.assertIn('class="ok" style="grid-column: 48"', html)
 

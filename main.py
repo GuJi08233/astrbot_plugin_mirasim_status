@@ -29,7 +29,7 @@ THRESHOLD_WARN = 50
 ALL_MODELS = "*"
 ALL_WORDS = ("all", "*", "全部")
 COHORT_ORDER = ("free", "paid", "cloud")
-COHORT_NAMES = {"free": "免费", "paid": "付费", "cloud": "云端"}
+COHORT_NAMES = {"free": "体验", "paid": "订阅", "cloud": "云端"}
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "status.html"
 # PNG keeps the small text crisp; "ultra" is a 1.8x device pixel ratio on the
 # official T2I service, which phones need once they scale the card down.
@@ -40,7 +40,7 @@ RENDER_OPTIONS = {
 }
 
 STATUS_ICONS = {"ok": "✅", "warn": "⚠️", "down": "❌", "nodata": "❔"}
-STATUS_NAMES = {"ok": "正常", "warn": "不稳定", "down": "中断", "nodata": "无数据"}
+STATUS_NAMES = {"ok": "正常", "warn": "不稳定", "down": "异常", "nodata": "无数据"}
 # Problems sort first so the top of the list is all a reader needs to check.
 STATUS_ORDER = {"down": 0, "warn": 1, "nodata": 2, "unknown": 2, "ok": 3}
 CHANGE_ICONS = {"ok": "🟢", "warn": "🟡", "down": "🔴", "nodata": "⚪"}
@@ -561,7 +561,7 @@ class MirasimStatus(Star):
 
             if new_status == "down":
                 line = (
-                    f"{icon} {model_id}（{label}）中断 {reason}"
+                    f"{icon} {model_id}（{label}）异常 {reason}"
                     f"（可用率 {availability_text}"
                 )
                 if (
@@ -593,7 +593,7 @@ class MirasimStatus(Star):
                     if outage_secs > 0:
                         outage = _fmt_duration(outage_secs)
                         prefix = "超过" if began_before else "约"
-                        line += f"，中断持续{prefix} {outage}"
+                        line += f"，异常持续{prefix} {outage}"
             else:
                 line = f"{icon} {model_id}（{label}）{STATUS_NAMES.get(new_status, new_status)}"
             lines_by_key.append((key, line))
@@ -814,7 +814,7 @@ class MirasimStatus(Star):
                     f"{_fmt_rate(availability, short=True)} · p50 {_fmt_seconds(p50)}"
                 )
                 if status == "down":
-                    note = _format_reasons(agent.get("reasons")) or "服务中断"
+                    note = _format_reasons(agent.get("reasons")) or "服务异常"
                 elif status == "warn":
                     note = "可用率波动"
                 elif status == "nodata":
@@ -946,7 +946,7 @@ class MirasimStatus(Star):
                     went_down = _cell_time(data, last_down_idx)
                     if went_down is not None:
                         lines.append(
-                            f"  近 24h 曾中断（{_fmt_time(went_down.isoformat())}）"
+                            f"  近 24h 曾异常（{_fmt_time(went_down.isoformat())}）"
                         )
                 stripe = "".join(
                     {"ok": "🟩", "warn": "🟨", "down": "🟥", "unknown": "⬜"}[b]
