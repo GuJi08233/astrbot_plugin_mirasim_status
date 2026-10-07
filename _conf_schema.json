@@ -14,7 +14,7 @@
   "display_models": {
     "description": "/mirasim 默认展示的模型",
     "type": "list",
-    "hint": "填写模型 ID（如 claude-opus-5-5）显示该模型全部池，或 模型@池（如 claude-opus-5-5@paid）只显示指定池；两种形式可混合。留空则展示全部。任何时候都可以用 /mirasim all 查看全部模型。",
+    "hint": "填写模型 ID（如 claude-opus-5-5）显示该模型全部池，或 模型@池（如 claude-opus-5-5@paid）只显示指定池；两种形式可混合。展示顺序按此列表顺序排列；留空则展示全部并按 问题在前、字母序 的默认顺序排列。任何时候都可以用 /mirasim all 查看全部模型。",
     "default": []
   },
   "poll_interval": {

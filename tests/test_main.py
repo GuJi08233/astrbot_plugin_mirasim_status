@@ -557,6 +557,25 @@ class CommandTest(unittest.TestCase):
         self.assertIn("  ✅ 订阅 ·", text)
         self.assertNotIn("  ✅ 云端 ·", text)
 
+    def test_display_models_order_is_respected(self):
+        # Even with kimi-k3 ok and claude-opus-5-5 down, kimi-k3 stays first
+        # because that's the order in display_models.
+        self.plugin.config["display_models"] = [
+            "kimi-k3",
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+        ]
+        text = run(command(self.plugin))
+        self.assertLess(text.index("· kimi-k3"), text.index("· claude-opus-5-5"))
+        self.assertLess(text.index("· claude-opus-5-5"), text.index("· claude-fable-5-1"))
+
+    def test_no_display_models_falls_back_to_status_first(self):
+        # display_models=[] (falsy) means "no filter": same default ordering.
+        self.plugin.config["display_models"] = []
+        text = run(command(self.plugin))
+        first_model_idx = text.index("· claude-opus-5-5")
+        self.assertLess(first_model_idx, text.index("· kimi-k3"))
+
     def test_detail_view_default_shows_all_cohorts(self):
         text = run(command(self.plugin, "claude-opus-5-5"))
         self.assertTrue(text.startswith("· claude-opus-5-5"))

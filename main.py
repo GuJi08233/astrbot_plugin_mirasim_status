@@ -782,7 +782,10 @@ class MirasimStatus(Star):
             worst = _worst_status([status for status, _e in tagged])
             agent_name = entries[0][2].get("name") or ""
             rows.append((model_id, tagged, agent_name, worst))
-        rows.sort(key=lambda r: (STATUS_ORDER.get(r[3], 99), r[0]))
+        if not filtered:
+            # No display_models configured: problems first, then alphabetical.
+            # The user's explicit order wins when they wrote one.
+            rows.sort(key=lambda r: (STATUS_ORDER.get(r[3], 99), r[0]))
         return [(m, e, a) for m, e, a, _w in rows], missing, filtered
 
     async def _render_overview_image(self, data: dict, show_all: bool) -> str | None:
