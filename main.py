@@ -20,11 +20,11 @@ MIN_POLL_INTERVAL = 60
 DEFAULT_POLL_INTERVAL = 60
 # One change of mind is enough at the official minute cadence; two keeps blips quiet.
 DEFAULT_CONFIRM_POLLS = 2
-# Availability thresholds (%). These are intentionally much looser than the
-# site's 99/95: at 95% a service is already flaky for end users, so we let it
-# count as normal until 90% and only call <50% a real outage.
-THRESHOLD_GOOD = 90
-THRESHOLD_WARN = 50
+# Availability thresholds (%). Even at 50% availability a service is still
+# usable (every other request fails), so we only call it 异常 below 30% and
+# count 65%+ as 正常 — much looser than the site's 99/95.
+THRESHOLD_GOOD = 65
+THRESHOLD_WARN = 30
 # Subscription entry meaning "every cohort of every model", including later models.
 ALL_MODELS = "*"
 ALL_WORDS = ("all", "*", "全部")

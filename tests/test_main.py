@@ -158,26 +158,27 @@ class ResolveIdTest(unittest.TestCase):
 
 
 class CellStatusTest(unittest.TestCase):
-    """The plugin uses 90/50 thresholds, much looser than the site's 99/95."""
+    """The plugin uses 65/30 thresholds: 65% is usable, <30% is a real outage."""
 
     def test_per_threshold_bucket(self):
-        # 90% availability (900/1000) and above counts as 正常.
-        self.assertEqual(main_mod._cell_status(1000, 90, 50), "ok")
-        self.assertEqual(main_mod._cell_status(900, 90, 50), "ok")
-        # 50–89.9% is 不稳定.
-        self.assertEqual(main_mod._cell_status(899, 90, 50), "warn")
-        self.assertEqual(main_mod._cell_status(500, 90, 50), "warn")
-        # Below 50% is 中断.
-        self.assertEqual(main_mod._cell_status(499, 90, 50), "down")
-        self.assertEqual(main_mod._cell_status(0, 90, 50), "down")
+        # 65% availability (650/1000) and above counts as 正常.
+        self.assertEqual(main_mod._cell_status(1000, 65, 30), "ok")
+        self.assertEqual(main_mod._cell_status(650, 65, 30), "ok")
+        # 30–64.9% is 不稳定.
+        self.assertEqual(main_mod._cell_status(649, 65, 30), "warn")
+        self.assertEqual(main_mod._cell_status(500, 65, 30), "warn")
+        self.assertEqual(main_mod._cell_status(300, 65, 30), "warn")
+        # Below 30% is 异常.
+        self.assertEqual(main_mod._cell_status(299, 65, 30), "down")
+        self.assertEqual(main_mod._cell_status(0, 65, 30), "down")
 
     def test_gap_is_unknown(self):
-        self.assertEqual(main_mod._cell_status(-1, 90, 50), "unknown")
-        self.assertEqual(main_mod._cell_status(None, 90, 50), "unknown")
+        self.assertEqual(main_mod._cell_status(-1, 65, 30), "unknown")
+        self.assertEqual(main_mod._cell_status(None, 65, 30), "unknown")
 
     def test_history_bars_use_loose_plugin_thresholds(self):
-        """A model at 95% availability shows as 正常 despite the site warning."""
-        cells = [950] * 48  # 95% everywhere — site says warn, plugin says ok.
+        """A model at 70% availability shows as 正常 despite the site warning."""
+        cells = [700] * 48  # 70% everywhere — site says down, plugin says ok.
         data = make_payload(
             agents_free=[make_agent("a", "A", [make_model("m", "m", cells=cells)])],
         )
@@ -192,18 +193,18 @@ class NowStatusTest(unittest.TestCase):
         return make_model("m", "m", status=status, availability=availability)
 
     def test_site_warn_but_plugin_ok(self):
-        # Site would say warn at 97%, plugin says ok (97 >= 90).
-        model = self._model("warn", 97.0)
-        self.assertEqual(main_mod._now_status_of(model), ("ok", 97.0))
+        # Site would say warn at 70%, plugin says ok (70 >= 65).
+        model = self._model("warn", 70.0)
+        self.assertEqual(main_mod._now_status_of(model), ("ok", 70.0))
 
     def test_site_down_but_plugin_warn(self):
-        # Site would say down at 91.9%, plugin says warn (50 ≤ 91.9 < 90 is False, so warn).
-        model = self._model("down", 70.0)
-        self.assertEqual(main_mod._now_status_of(model), ("warn", 70.0))
+        # Site would say down at 50%, plugin says warn (30 ≤ 50 < 65).
+        model = self._model("down", 50.0)
+        self.assertEqual(main_mod._now_status_of(model), ("warn", 50.0))
 
     def test_really_down(self):
-        model = self._model("down", 30.0)
-        self.assertEqual(main_mod._now_status_of(model), ("down", 30.0))
+        model = self._model("down", 20.0)
+        self.assertEqual(main_mod._now_status_of(model), ("down", 20.0))
 
     def test_no_data(self):
         model = self._model("down", None)
