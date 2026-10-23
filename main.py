@@ -642,6 +642,52 @@ def _model_aliases(models: dict[str, dict]) -> dict[str, str]:
     return aliases
 
 
+def _match_keys(
+    models: dict[str, dict], query: str, aliases: dict[str, str]
+) -> list[str]:
+    """Return the model keys a configured entry selects.
+
+    A model name selects one model. A vendor name selects every model of
+    that vendor, because the keys carry the model name alone and so
+    ``gpt`` or ``deepseek`` names no key of its own.
+
+    Args:
+        models: Model index from ``_collect_models``.
+        query: The model or vendor the entry names.
+        aliases: Legacy spellings mapped onto current keys.
+
+    Returns:
+        The matching keys, empty when the entry names nothing.
+
+    Raises:
+        LookupError: The query is part of several model names; the message is
+            user-facing.
+    """
+    needle = _slug(query)
+    if not needle:
+        return []
+    for key in models:
+        if key == needle:
+            return [key]
+    if needle in aliases:
+        return [aliases[needle]]
+    vendor = [
+        key
+        for key, record in models.items()
+        if needle in (_slug(record.get("agent")), _slug(record.get("agent_id")))
+    ]
+    if vendor:
+        return vendor
+    hits = sorted(key for key in models if needle in key)
+    if len(hits) == 1:
+        return hits
+    if hits:
+        raise LookupError(
+            f"「{query}」匹配到多个模型：{'、'.join(hits)}，请输入更完整的名称。"
+        )
+    return []
+
+
 def _collect_agents(data: object) -> dict[str, dict]:
     """Index every agent by ID with its per-cohort blobs.
 
@@ -1008,8 +1054,9 @@ class MirasimStatus(Star):
         """Pick, filter and sort the models shown in the overview.
 
         Each ``display_models`` entry is either a plain model name (shows every
-        cohort) or ``model@cohort`` (shows only that cohort). Plain names and
-        cohort-suffixed names may be mixed freely.
+        cohort), a vendor name (shows every model of that vendor) or a
+        ``model@cohort`` form (shows only that cohort). The forms may be
+        mixed freely.
 
         Args:
             data: Status payload.
@@ -1036,25 +1083,37 @@ class MirasimStatus(Star):
                 if not model_part:
                     continue
                 try:
-                    key = _resolve_key(list(models), model_part, "", aliases)
-                except LookupError:
+                    keys = _match_keys(models, model_part, aliases)
+                except LookupError as exc:
+                    missing.append(raw)
+                    logger.warning(f"[Mirasim] {exc}")
+                    continue
+                if not keys:
                     missing.append(raw)
                     continue
-                # Already chose this model with no cohort filter: nothing changes.
-                if key in chosen and chosen[key] is None:
-                    continue
-                if cohort_part is None:
-                    chosen[key] = None
-                    continue
-                available = {c for c, _m, _a in models[key]["entries"]}
-                if cohort_part not in available:
-                    missing.append(raw)
-                    continue
-                bucket = chosen.get(key)
-                if bucket is None and key not in chosen:
-                    chosen[key] = {cohort_part}
-                elif bucket is not None:
-                    bucket.add(cohort_part)
+                # A cohort filter applies to the models that actually have it.
+                picked = keys
+                if cohort_part is not None:
+                    picked = [
+                        key
+                        for key in keys
+                        if cohort_part in {c for c, _m, _a in models[key]["entries"]}
+                    ]
+                    if not picked:
+                        missing.append(raw)
+                        continue
+                for key in picked:
+                    # Already chose this model with no cohort filter: nothing changes.
+                    if key in chosen and chosen[key] is None:
+                        continue
+                    if cohort_part is None:
+                        chosen[key] = None
+                        continue
+                    bucket = chosen.get(key)
+                    if bucket is None and key not in chosen:
+                        chosen[key] = {cohort_part}
+                    elif bucket is not None:
+                        bucket.add(cohort_part)
         else:
             chosen = dict.fromkeys(models)
 

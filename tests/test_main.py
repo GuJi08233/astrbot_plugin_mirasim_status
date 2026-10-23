@@ -418,6 +418,74 @@ class LegacyNameTest(unittest.TestCase):
         self.assertEqual([m["key"] for m in groups[0]["models"]], ["opus-5-5"])
 
 
+class VendorFilterTest(unittest.TestCase):
+    """A configured entry may name a vendor instead of every single model."""
+
+    def setUp(self):
+        self.data = make_payload(
+            agents_free=[
+                make_agent(
+                    "claude-code",
+                    "Claude",
+                    [make_model("opus 5.5"), make_model("sonnet 5.5")],
+                ),
+                make_agent(
+                    "codex", "GPT", [make_model("gpt-6-astra"), make_model("gpt-6-luna")]
+                ),
+                make_agent("dsh", "DeepSeek", [make_model("v4.1-flash")]),
+            ],
+            # Only one GPT model is served from the paid pool.
+            agents_paid=[make_agent("codex", "GPT", [make_model("gpt-6-astra")])],
+        )
+
+    def overview(self, display_models):
+        plugin = make_plugin(display_models=display_models)
+        plugin._fetch_status = AsyncMock(return_value=self.data)
+        return plugin._overview_groups(self.data, show_all=False)
+
+    def test_vendor_name_selects_every_model_of_that_vendor(self):
+        groups, missing, filtered = self.overview(["gpt"])
+        self.assertEqual(missing, [])
+        self.assertEqual([g["agent"] for g in groups], ["GPT"])
+        self.assertEqual(
+            sorted(m["key"] for m in groups[0]["models"]),
+            ["gpt-6-astra", "gpt-6-luna"],
+        )
+
+    def test_vendor_id_also_works(self):
+        groups, missing, _ = self.overview(["dsh"])
+        self.assertEqual(missing, [])
+        self.assertEqual([m["key"] for m in groups[0]["models"]], ["v4-1-flash"])
+
+    def test_two_vendors_can_be_mixed_with_a_model(self):
+        groups, missing, _ = self.overview(["deepseek", "opus-5-5"])
+        self.assertEqual(missing, [])
+        self.assertEqual(sorted(g["agent"] for g in groups), ["Claude", "DeepSeek"])
+
+    def test_vendor_with_a_cohort_limits_the_pools(self):
+        groups, missing, _ = self.overview(["gpt@paid"])
+        self.assertEqual(missing, [])
+        self.assertEqual([g["agent"] for g in groups], ["GPT"])
+        # Only the model that serves the paid pool is kept.
+        self.assertEqual([m["key"] for m in groups[0]["models"]], ["gpt-6-astra"])
+        self.assertEqual(groups[0]["cohorts"], ["paid"])
+
+    def test_vendor_with_a_cohort_nobody_serves_is_reported(self):
+        groups, missing, _ = self.overview(["deepseek@paid"])
+        self.assertEqual(groups, [])
+        self.assertEqual(missing, ["deepseek@paid"])
+
+    def test_ambiguous_partial_name_is_reported(self):
+        groups, missing, _ = self.overview(["gpt-6"])
+        self.assertEqual(groups, [])
+        self.assertEqual(missing, ["gpt-6"])
+
+    def test_unknown_entry_is_reported(self):
+        groups, missing, _ = self.overview(["no-such-model"])
+        self.assertEqual(groups, [])
+        self.assertEqual(missing, ["no-such-model"])
+
+
 class TargetSplitTest(unittest.TestCase):
     def test_plain_and_suffixed_forms(self):
         self.assertEqual(main_mod._split_target("opus 5.5"), ("opus 5.5", None))
