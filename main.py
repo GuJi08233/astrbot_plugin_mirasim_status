@@ -1,9 +1,19 @@
-"""Mirasim traffic-based availability monitor: status on demand, change pushes."""
+"""Mirasim status monitor: on-demand status cards and confirmed change pushes.
+
+The status payload (schema 2) is organised as cohorts -> agents -> models. A
+model's ``id`` is only unique *inside one agent* (``m1``..``m6`` repeat in every
+agent and cohort), while its ``name`` is the real identity (``opus 5.5``), so
+every model here is keyed by a slug of that name. Statuses come straight from
+the payload's ``now.status`` and its own ``thresholds`` block.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
+import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -13,23 +23,38 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
 
+try:  # AstrBot's own commands annotate trailing params with this marker class.
+    from astrbot.core.star.filter.command import GreedyStr
+except Exception:  # pragma: no cover - very old AstrBot without the marker
+    GreedyStr = str
+
 DEFAULT_API_URL = "https://mirasim.ai/api/status"
 REQUEST_TIMEOUT = 20
-# mirasim.ai refreshes its aggregation once a minute, a faster poll finds nothing.
+# mirasim.ai refreshes its aggregation once a minute; a faster poll finds nothing.
 MIN_POLL_INTERVAL = 60
 DEFAULT_POLL_INTERVAL = 60
 # One change of mind is enough at the official minute cadence; two keeps blips quiet.
 DEFAULT_CONFIRM_POLLS = 2
-# Availability thresholds (%). Even at 50% availability a service is still
-# usable (every other request fails), so we only call it 异常 below 30% and
-# count 65%+ as 正常 — much looser than the site's 99/95.
-THRESHOLD_GOOD = 65
-THRESHOLD_WARN = 30
+# Fallbacks used only when a payload arrives without its own thresholds block.
+DEFAULT_THRESHOLD_GOOD = 99.0
+DEFAULT_THRESHOLD_WARN = 95.0
+# Reuse a just-fetched payload for this long so one burst of commands costs one request.
+CACHE_TTL = 10
 # Subscription entry meaning "every cohort of every model", including later models.
 ALL_MODELS = "*"
 ALL_WORDS = ("all", "*", "全部")
 COHORT_ORDER = ("free", "paid", "cloud")
-COHORT_NAMES = {"free": "体验", "paid": "订阅", "cloud": "云端"}
+COHORT_NAMES = {"free": "免费", "paid": "订阅", "cloud": "云端"}
+# What a user may type for a cohort: the ID, or the Chinese label.
+COHORT_ALIASES = {
+    "free": "free",
+    "paid": "paid",
+    "cloud": "cloud",
+    "免费": "free",
+    "体验": "free",
+    "订阅": "paid",
+    "云端": "cloud",
+}
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "status.html"
 # PNG keeps the small text crisp; "ultra" is a 1.8x device pixel ratio on the
 # official T2I service, which phones need once they scale the card down.
@@ -39,30 +64,82 @@ RENDER_OPTIONS = {
     "device_scale_factor_level": "ultra",
 }
 
-STATUS_ICONS = {"ok": "✅", "warn": "⚠️", "down": "❌", "nodata": "❔"}
-STATUS_NAMES = {"ok": "正常", "warn": "不稳定", "down": "异常", "nodata": "无数据"}
+STATUS_ICONS = {
+    "ok": "✅",
+    "degraded": "⚠️",
+    "down": "❌",
+    "nodata": "❔",
+    "unknown": "❔",
+}
+STATUS_NAMES = {
+    "ok": "正常",
+    "degraded": "降级",
+    "down": "异常",
+    "nodata": "无数据",
+    "unknown": "未知",
+}
 # Problems sort first so the top of the list is all a reader needs to check.
-STATUS_ORDER = {"down": 0, "warn": 1, "nodata": 2, "unknown": 2, "ok": 3}
-CHANGE_ICONS = {"ok": "🟢", "warn": "🟡", "down": "🔴", "nodata": "⚪"}
+STATUS_ORDER = {"down": 0, "degraded": 1, "nodata": 2, "unknown": 2, "ok": 3}
+CHANGE_ICONS = {"ok": "🟢", "degraded": "🟡", "down": "🔴", "nodata": "⚪"}
+STRIPE_ICONS = {"ok": "🟩", "degraded": "🟨", "down": "🟥", "unknown": "⬜"}
+# The payload spells statuses its own way; accept the common variants too.
+STATUS_ALIASES = {
+    "ok": "ok",
+    "good": "ok",
+    "healthy": "ok",
+    "up": "ok",
+    "degraded": "degraded",
+    "warn": "degraded",
+    "warning": "degraded",
+    "unstable": "degraded",
+    "down": "down",
+    "bad": "down",
+    "error": "down",
+    "outage": "down",
+    "nodata": "nodata",
+    "no_data": "nodata",
+    "none": "nodata",
+    "unknown": "unknown",
+}
 # Failure classes reported at the agent level, worded the way the site does.
 REASON_NAMES = {
     "throttle": "限流",
+    "rate_limit": "限流",
     "outage": "故障",
     "capacity": "容量不足",
+    "overload": "过载",
     "error": "错误",
+    "latency": "延迟",
+    "quality": "质量",
 }
 
 USAGE = (
     "Mirasim 模型状态\n"
-    "/mirasim — 查看模型状态\n"
+    "/mirasim — 查看模型状态（默认图片卡片）\n"
     "/mirasim all — 查看全部模型\n"
     "/mirasim <模型> — 查看单个模型各池详情\n"
     "/mirasim <模型>@<free|paid|cloud> — 只看指定池\n"
+    "/mirasim agents — 按厂商查看整体状态\n"
     "/mirasim sub <模型>[@池]|all — 本会话订阅状态变化推送\n"
     "/mirasim unsub <模型>[@池]|all — 取消订阅\n"
     "/mirasim list — 查看本会话的订阅\n"
-    "模型名可只写能唯一确定的一部分，如 opus-5-5。"
+    "/mirasim help — 显示本说明\n"
+    "模型名可只写能唯一确定的一部分，如 opus-5-5、gpt 6 astra。"
 )
+
+
+def _slug(text: object) -> str:
+    """Turn a display name into a stable lowercase key.
+
+    Args:
+        text: Anything name-like, e.g. ``Gemini 4 Argon`` or ``gpt-6.1-sol``.
+
+    Returns:
+        Letters and digits joined by single dashes, e.g. ``gemini-4-argon``.
+    """
+    if not isinstance(text, str):
+        return ""
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", text.lower())).strip("-")
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -113,9 +190,9 @@ def _fmt_duration(seconds: float) -> str:
     hours, rest = divmod(rest, 3600)
     minutes, secs = divmod(rest, 60)
     if days:
-        return f"{days}天{hours}小时"
+        return f"{days}天{hours}小时" if hours else f"{days}天"
     if hours:
-        return f"{hours}小时{minutes}分钟"
+        return f"{hours}小时{minutes}分钟" if minutes else f"{hours}小时"
     if minutes:
         return f"{minutes}分钟"
     return f"{secs}秒"
@@ -130,7 +207,7 @@ def _fmt_seconds(value: object) -> str:
     Returns:
         The formatted latency, or ``—``.
     """
-    if not isinstance(value, (int, float)) or value < 0:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
         return "—"
     return f"{value:.1f}s"
 
@@ -145,27 +222,135 @@ def _fmt_rate(value: object, *, short: bool = False) -> str:
     Returns:
         The formatted percentage.
     """
-    if not isinstance(value, (int, float)):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         return "—"
     return f"{round(value, 1):g}%" if short else f"{value:.1f}%"
 
 
+WINDOW_UNITS = {"m": "分钟", "h": "小时", "d": "天"}
+
+
+def _fmt_window(value: object) -> str:
+    """Format the aggregation window the site reports, e.g. ``15m`` -> ``15分钟``.
+
+    Args:
+        value: Raw ``window`` field; ``null`` on most model entries.
+
+    Returns:
+        Human text, or an empty string when unknown.
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    match = re.fullmatch(r"\s*(\d+)\s*([mhd])\s*", value.lower())
+    if not match:
+        return value
+    amount, unit = int(match.group(1)), match.group(2)
+    return f"{amount}{WINDOW_UNITS[unit]}"
+
+
+def _thresholds(data: object) -> tuple[float, float, int | None]:
+    """Read the site's own availability thresholds.
+
+    The payload ships ``thresholds: {good, warn, minTurns}``; using it keeps the
+    plugin's wording in step with the status page instead of guessing.
+
+    Args:
+        data: Status payload.
+
+    Returns:
+        ``(good, warn, min_turns)`` with fallbacks for missing or inverted values.
+    """
+    raw = data.get("thresholds") if isinstance(data, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    good = raw.get("good")
+    warn = raw.get("warn")
+    min_turns = raw.get("minTurns")
+    good = (
+        float(good)
+        if isinstance(good, (int, float)) and not isinstance(good, bool)
+        else DEFAULT_THRESHOLD_GOOD
+    )
+    warn = (
+        float(warn)
+        if isinstance(warn, (int, float)) and not isinstance(warn, bool)
+        else DEFAULT_THRESHOLD_WARN
+    )
+    if warn > good:
+        warn = good
+    min_turns = (
+        min_turns
+        if isinstance(min_turns, int) and not isinstance(min_turns, bool)
+        else None
+    )
+    return good, warn, min_turns
+
+
+def _status_from_availability(availability: object, good: float, warn: float) -> str:
+    """Bucket an availability percentage against the site's thresholds.
+
+    Args:
+        availability: Percentage as a number.
+        good: At or above this the model counts as 正常.
+        warn: At or above this it counts as 降级.
+
+    Returns:
+        ``ok``, ``degraded``, ``down`` or ``nodata``.
+    """
+    if not isinstance(availability, (int, float)) or isinstance(availability, bool):
+        return "nodata"
+    if availability >= good:
+        return "ok"
+    if availability >= warn:
+        return "degraded"
+    return "down"
+
+
+def _model_status(model: dict, data: object = None) -> tuple[str, float | None]:
+    """Read a model's current status and availability.
+
+    ``now.status`` is authoritative because the site weighs turn counts on top
+    of the percentage; availability only decides the bucket when the status is
+    missing or in an unknown vocabulary.
+
+    Args:
+        model: Model dict from the payload.
+        data: Whole payload, for its thresholds block.
+
+    Returns:
+        ``(status, availability)`` where status is ok/degraded/down/nodata.
+    """
+    now = model.get("now") if isinstance(model, dict) else None
+    now = now if isinstance(now, dict) else {}
+    availability = now.get("availability")
+    raw_status = now.get("status")
+    if isinstance(raw_status, str):
+        status = STATUS_ALIASES.get(raw_status.strip().lower())
+        if status:
+            return status, availability if isinstance(
+                availability, (int, float)
+            ) else None
+    good, warn, _min_turns = _thresholds(data)
+    return _status_from_availability(availability, good, warn), (
+        availability if isinstance(availability, (int, float)) else None
+    )
+
+
 def _cell_status(value: object, good: float, warn: float) -> str:
-    """Translate one 30-minute cell to a colour bucket.
+    """Translate one history cell to a colour bucket.
 
     Cells are stored as availability ×10 (1000 = 100%), and -1 marks a gap.
 
     Args:
         value: Raw cell value.
         good: Availability percentage still counted as 正常.
-        warn: Availability percentage still counted as 不稳定.
+        warn: Availability percentage still counted as 降级.
 
     Returns:
-        One of ``ok``, ``warn``, ``down``, ``unknown``.
+        One of ``ok``, ``degraded``, ``down``, ``unknown``.
     """
-    if not isinstance(value, (int, float)) or value < 0:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
         return "unknown"
-    return "ok" if value >= 10 * good else ("warn" if value >= 10 * warn else "down")
+    return _status_from_availability(value / 10.0, good, warn)
 
 
 def _worst_status(statuses: list[str]) -> str:
@@ -180,22 +365,20 @@ def _worst_status(statuses: list[str]) -> str:
     return min(statuses, key=lambda s: STATUS_ORDER.get(s, 99), default="unknown")
 
 
-def _history_bars(cells: object, data: dict) -> list[str]:
+def _history_bars(cells: object, data: object = None) -> list[str]:
     """Build the per-cell status list used by stripes and outage bounds.
-
-    The plugin ignores the site's own thresholds (99/95) and applies the
-    looser THRESHOLD_GOOD/WARN — see their comments for why.
 
     Args:
         cells: Raw ``cells`` array of a model.
-        data: Whole payload; reserved for future per-payload overrides.
+        data: Whole payload, for its thresholds block.
 
     Returns:
-        One ``ok``/``warn``/``down``/``unknown`` per cell, oldest first.
+        One ``ok``/``degraded``/``down``/``unknown`` per cell, oldest first.
     """
     if not isinstance(cells, list):
         return []
-    return [_cell_status(value, THRESHOLD_GOOD, THRESHOLD_WARN) for value in cells]
+    good, warn, _min_turns = _thresholds(data)
+    return [_cell_status(value, good, warn) for value in cells]
 
 
 def _cell_time(data: dict, index: int) -> datetime | None:
@@ -228,39 +411,70 @@ def _last_healthy_time(bars: list[str], data: dict) -> datetime | None:
         An aware datetime, or None when nothing healthy is visible.
     """
     for i in range(len(bars) - 1, -1, -1):
-        if bars[i] in ("ok", "warn"):
+        if bars[i] in ("ok", "degraded"):
             return _cell_time(data, i)
     return None
 
 
-def _resolve_id(ids: list[str], query: str, hint: str) -> str:
-    """Resolve user input to exactly one model ID.
-
-    A case-insensitive exact match wins; otherwise the input must be part of
-    exactly one ID, so ``opus-5-5`` finds ``claude-opus-5-5``.
+def _last_streak(bars: list[str], targets: tuple[str, ...]) -> tuple[int, int] | None:
+    """Locate the newest run of cells whose status is in ``targets``.
 
     Args:
-        ids: Candidate model IDs.
-        query: What the user typed.
-        hint: Appended to the "not found" message to point at the next step.
+        bars: Per-cell statuses ordered oldest first.
+        targets: Statuses that count as part of the run.
 
     Returns:
-        The matched model ID.
+        ``(start_index, length)`` of the trailing run, or None when there is none.
+    """
+    end = len(bars) - 1
+    while end >= 0 and bars[end] not in targets:
+        end -= 1
+    if end < 0:
+        return None
+    start = end
+    while start >= 0 and bars[start] in targets:
+        start -= 1
+    start += 1
+    return start, end - start + 1
+
+
+def _resolve_key(
+    keys: list[str], query: str, hint: str, aliases: dict[str, str] | None = None
+) -> str:
+    """Resolve user input to exactly one model key.
+
+    A slug-exact match wins; otherwise the input must be part of exactly one
+    key, so ``opus-5-5`` and ``opus 5.5`` both find ``opus-5-5``.
+
+    Args:
+        keys: Candidate model keys (already slugged).
+        query: What the user typed.
+        hint: Appended to the "not found" message to point at the next step.
+        aliases: Legacy spellings mapped onto current keys, see
+            ``_model_aliases``. Matched exactly, after the current keys, so a
+            name that is already valid keeps winning.
+
+    Returns:
+        The matched key.
 
     Raises:
-        LookupError: Nothing or several IDs match; the message is user-facing.
+        LookupError: Nothing or several keys match; the message is user-facing.
     """
-    needle = query.lower()
-    for model_id in ids:
-        if model_id.lower() == needle:
-            return model_id
-    hits = sorted(model_id for model_id in ids if needle in model_id.lower())
+    needle = _slug(query)
+    if not needle:
+        raise LookupError(f"没有找到匹配「{query}」的模型，{hint}")
+    for key in keys:
+        if key == needle:
+            return key
+    if aliases and needle in aliases:
+        return aliases[needle]
+    hits = sorted(key for key in keys if needle in key)
     if len(hits) == 1:
         return hits[0]
     if not hits:
         raise LookupError(f"没有找到匹配「{query}」的模型，{hint}")
     raise LookupError(
-        f"「{query}」匹配到多个模型：{'、'.join(hits)}，请输入更完整的 ID。"
+        f"「{query}」匹配到多个模型：{'、'.join(hits)}，请输入更完整的名称。"
     )
 
 
@@ -271,20 +485,26 @@ def _split_target(text: str) -> tuple[str, str | None]:
         text: Raw target from the user.
 
     Returns:
-        ``(model_part, cohort_part or None)``.
+        ``(model_part, cohort_part or None)``; the cohort is normalised to its ID.
     """
     if "@" not in text:
         return text.strip(), None
     model_part, cohort_part = text.rsplit("@", 1)
-    return model_part.strip(), cohort_part.strip().lower() or None
+    raw_cohort = cohort_part.strip().lower()
+    if not raw_cohort:
+        return model_part.strip(), None
+    return model_part.strip(), COHORT_ALIASES.get(raw_cohort, raw_cohort)
 
 
-def _covers(entry: str, key: str) -> bool:
+def _covers(entry: str, key: str, aliases: dict[str, str] | None = None) -> bool:
     """Tell whether a subscription entry matches a ``model@cohort`` change key.
 
     Args:
         entry: Stored subscription, ``model``, ``model@cohort`` or ``*``.
         key: Change key, always ``model@cohort``.
+        aliases: Legacy spellings mapped onto current keys, see
+            ``_model_aliases``. A subscription stored under the old
+            vendor-prefixed name still covers the model it names today.
 
     Returns:
         True when the entry wants this key.
@@ -293,19 +513,22 @@ def _covers(entry: str, key: str) -> bool:
         return True
     model_part, cohort_part = _split_target(entry)
     key_model, key_cohort = _split_target(key)
-    if key_model != model_part:
+    if key_model != model_part and (
+        not aliases or aliases.get(model_part) != key_model
+    ):
         return False
     return cohort_part is None or cohort_part == key_cohort
 
 
 def _format_reasons(reasons: object) -> str:
-    """Render the agent-level failure breakdown as a short parenthetical.
+    """Render the agent-level failure breakdown as bare text.
 
     Args:
-        reasons: ``reasons`` list from the agent summary.
+        reasons: ``reasons`` list from the agent blob.
 
     Returns:
-        Text such as ``(限流79%·故障21%)`` or empty string.
+        Text such as ``限流79%·故障21%``, or an empty string when there is none.
+        Callers add their own brackets so the result reads well inline.
     """
     if not isinstance(reasons, list):
         return ""
@@ -315,35 +538,186 @@ def _format_reasons(reasons: object) -> str:
             continue
         cls = item.get("class")
         share = item.get("share")
-        if not cls or not isinstance(share, (int, float)) or share < 1:
+        if not cls or not isinstance(share, (int, float)) or isinstance(share, bool):
             continue
-        label = REASON_NAMES.get(cls, str(cls))
-        parts.append(f"{label}{round(share):g}%")
-    return f"({'·'.join(parts)})" if parts else ""
+        if share < 1:
+            continue
+        label = REASON_NAMES.get(str(cls), str(cls))
+        parts.append(f"{label}{_fmt_share(share)}%")
+    return "·".join(parts)
 
 
-def _now_status_of(model: dict) -> tuple[str, float | None]:
-    """Read a model's current status and availability.
+def _fmt_share(value: float) -> str:
+    """Round a percentage share to a whole number, halves going up.
 
-    The plugin recomputes the bucket from ``availability`` instead of trusting
-    ``now.status``, because the site uses much stricter thresholds (99/95)
-    than the plugin does (see THRESHOLD_GOOD/WARN).
+    ``round()`` and ``f"{x:.0f}"`` both round halves to even, so 78.5 would
+    print as ``78`` while the monitor shows ``79``. The API ships whole numbers
+    today (100, 98, 2); this keeps any future decimal sane.
 
     Args:
-        model: Model dict from the payload.
+        value: Share such as ``100`` or ``21.4``.
 
     Returns:
-        ``(status, availability)`` where status is ok/warn/down/nodata.
+        ``100`` or ``21``.
     """
-    now = model.get("now") or {}
-    availability = now.get("availability")
-    if not isinstance(availability, (int, float)):
-        return "nodata", None
-    if availability >= THRESHOLD_GOOD:
-        return "ok", availability
-    if availability >= THRESHOLD_WARN:
-        return "warn", availability
-    return "down", availability
+    return f"{math.floor(float(value) + 0.5)}"
+
+
+def _reason_note(reasons: object) -> str:
+    """Wrap :func:`_format_reasons` in brackets for inline use.
+
+    Args:
+        reasons: ``reasons`` list from the agent blob.
+
+    Returns:
+        ``(限流79%·故障21%)``, or an empty string when there is none.
+    """
+    text = _format_reasons(reasons)
+    return f"（{text}）" if text else ""
+
+
+def _collect_models(data: object) -> dict[str, dict]:
+    """Index every model by its display-name slug, with its per-cohort entries.
+
+    Args:
+        data: Status payload.
+
+    Returns:
+        ``{key: {"key", "name", "agent", "agent_id", "entries"}}`` in payload
+        order; ``entries`` holds ``(cohort_id, model_dict, agent_dict)`` sorted
+        by COHORT_ORDER.
+    """
+    index: dict[str, dict] = {}
+    cohorts = data.get("cohorts") if isinstance(data, dict) else None
+    for cohort in cohorts or []:
+        cohort_id = cohort.get("id")
+        if not cohort_id:
+            continue
+        for agent in cohort.get("agents") or []:
+            for model in agent.get("models") or []:
+                key = _slug(model.get("name")) or _slug(model.get("id"))
+                if not key:
+                    continue
+                record = index.get(key)
+                if record is None:
+                    record = {
+                        "key": key,
+                        "name": model.get("name") or key,
+                        "agent": agent.get("name") or agent.get("id") or "",
+                        "agent_id": agent.get("id") or "",
+                        "entries": [],
+                    }
+                    index[key] = record
+                record["entries"].append((cohort_id, model, agent))
+    order = {cid: i for i, cid in enumerate(COHORT_ORDER)}
+    for record in index.values():
+        record["entries"].sort(key=lambda e: order.get(e[0], len(COHORT_ORDER)))
+    return index
+
+
+def _model_aliases(models: dict[str, dict]) -> dict[str, str]:
+    """Map the vendor-prefixed model names onto the current keys.
+
+    A model used to be named after its vendor and its model, ``claude-opus-5-5``.
+    The payload now repeats a short id inside every agent, so the model name
+    alone is the identity and the key is ``opus-5-5``. Keeping the old
+    spelling working means a stored ``display_models`` entry or a
+    subscription survives the switch instead of silently going cold.
+
+    Args:
+        models: Model index from ``_collect_models``.
+
+    Returns:
+        ``{alias_slug: model_key}`` for every vendor-prefixed spelling.
+    """
+    aliases: dict[str, str] = {}
+    for key, record in models.items():
+        for prefix in (record.get("agent"), record.get("agent_id")):
+            slug = _slug(prefix)
+            if not slug:
+                continue
+            alias = _slug(f"{slug}-{record['name']}")
+            if alias and alias != key:
+                aliases[alias] = key
+    return aliases
+
+
+def _collect_agents(data: object) -> dict[str, dict]:
+    """Index every agent by ID with its per-cohort blobs.
+
+    Args:
+        data: Status payload.
+
+    Returns:
+        ``{agent_id: {"agent_id", "name", "entries"}}`` in payload order;
+        ``entries`` holds ``(cohort_id, agent_dict)`` sorted by COHORT_ORDER.
+    """
+    index: dict[str, dict] = {}
+    cohorts = data.get("cohorts") if isinstance(data, dict) else None
+    for cohort in cohorts or []:
+        cohort_id = cohort.get("id")
+        if not cohort_id:
+            continue
+        for agent in cohort.get("agents") or []:
+            agent_id = agent.get("id") or agent.get("name")
+            if not agent_id:
+                continue
+            record = index.setdefault(
+                agent_id,
+                {
+                    "agent_id": agent_id,
+                    "name": agent.get("name") or agent_id,
+                    "entries": [],
+                },
+            )
+            record["entries"].append((cohort_id, agent))
+    order = {cid: i for i, cid in enumerate(COHORT_ORDER)}
+    for record in index.values():
+        record["entries"].sort(key=lambda e: order.get(e[0], len(COHORT_ORDER)))
+    return index
+
+
+def _cohort_state(data: object) -> dict[str, str]:
+    """Read each cohort's own rolled-up state.
+
+    Args:
+        data: Status payload.
+
+    Returns:
+        ``{cohort_id: state}`` using the same status vocabulary as models.
+    """
+    states: dict[str, str] = {}
+    cohorts = data.get("cohorts") if isinstance(data, dict) else None
+    for cohort in cohorts or []:
+        cohort_id = cohort.get("id")
+        raw = cohort.get("state")
+        if not cohort_id or not isinstance(raw, str):
+            continue
+        states[cohort_id] = STATUS_ALIASES.get(raw.strip().lower(), "unknown")
+    return states
+
+
+def _agent_status(agent: dict, data: object = None) -> tuple[str, float | None]:
+    """Read an agent's rolled-up status from its ``summary`` block.
+
+    Args:
+        agent: Agent dict from the payload.
+        data: Whole payload, for its thresholds block.
+
+    Returns:
+        ``(status, availability)``, falling back to the agent's first model.
+    """
+    summary = agent.get("summary") if isinstance(agent, dict) else None
+    summary = summary if isinstance(summary, dict) else {}
+    if summary:
+        status, availability = _model_status(summary, data)
+        if status != "nodata":
+            return status, availability
+    for model in agent.get("models") or []:
+        status, availability = _model_status(model, data)
+        if status != "nodata":
+            return status, availability
+    return "nodata", None
 
 
 class MirasimStatus(Star):
@@ -357,6 +731,8 @@ class MirasimStatus(Star):
         # model@cohort -> confirmed status as of the last poll, the push baseline.
         self._states: dict[str, str] = {}
         self._task: asyncio.Task | None = None
+        # (monotonic timestamp, payload) reused for CACHE_TTL seconds.
+        self._cache: tuple[float, dict] | None = None
 
     async def initialize(self) -> None:
         """Restore persisted state and start the background poller."""
@@ -371,8 +747,11 @@ class MirasimStatus(Star):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
 
-    async def _fetch_status(self) -> dict:
+    async def _fetch_status(self, *, use_cache: bool = True) -> dict:
         """Fetch the latest snapshot from the monitor.
+
+        Args:
+            use_cache: Reuse a payload fetched within CACHE_TTL seconds.
 
         Returns:
             The decoded status payload.
@@ -381,6 +760,11 @@ class MirasimStatus(Star):
             httpx.HTTPError: The request failed or returned an error status.
             ValueError: The body is not a status document.
         """
+        now = time.monotonic()
+        if use_cache and self._cache is not None:
+            cached_at, cached = self._cache
+            if now - cached_at < CACHE_TTL:
+                return cached
         url = str(self.config.get("api_url") or DEFAULT_API_URL).strip()
         # httpx honours the proxy environment AstrBot sets from its settings.
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -389,52 +773,8 @@ class MirasimStatus(Star):
             data = resp.json()
         if not isinstance(data, dict) or not isinstance(data.get("cohorts"), list):
             raise ValueError("unexpected status payload")
+        self._cache = (now, data)
         return data
-
-    def _all_models(self, data: dict) -> dict[str, list[tuple[str, dict, dict]]]:
-        """Group every model by ID with its per-cohort entries.
-
-        Args:
-            data: Status payload.
-
-        Returns:
-            ``{model_id: [(cohort_id, model_dict, agent_dict), ...]}``
-            ordered by COHORT_ORDER.
-        """
-        result: dict[str, list[tuple[str, dict, dict]]] = {}
-        cohort_index = {cid: i for i, cid in enumerate(COHORT_ORDER)}
-        for cohort in data.get("cohorts") or []:
-            cohort_id = cohort.get("id")
-            if not cohort_id:
-                continue
-            for agent in cohort.get("agents") or []:
-                for model in agent.get("models") or []:
-                    model_id = model.get("id")
-                    if not model_id:
-                        continue
-                    result.setdefault(model_id, []).append((cohort_id, model, agent))
-        for entries in result.values():
-            entries.sort(key=lambda e: cohort_index.get(e[0], len(COHORT_ORDER)))
-        return result
-
-    def _agent_by_id(self, data: dict, cohort_id: str, agent_id: str) -> dict | None:
-        """Locate one agent blob in the payload.
-
-        Args:
-            data: Status payload.
-            cohort_id: Cohort the agent belongs to.
-            agent_id: Agent ID to look up.
-
-        Returns:
-            The agent dict, or None when absent.
-        """
-        for cohort in data.get("cohorts") or []:
-            if cohort.get("id") != cohort_id:
-                continue
-            for agent in cohort.get("agents") or []:
-                if agent.get("id") == agent_id:
-                    return agent
-        return None
 
     async def _poll_loop(self) -> None:
         """Poll the monitor forever and push confirmed status changes."""
@@ -451,7 +791,7 @@ class MirasimStatus(Star):
             )
             await asyncio.sleep(interval)
             try:
-                data = await self._fetch_status()
+                data = await self._fetch_status(use_cache=False)
                 await self._check_changes(data, prev_data)
                 prev_data = data
             except Exception as exc:
@@ -460,7 +800,7 @@ class MirasimStatus(Star):
     async def _check_changes(self, data: dict, prev_data: dict | None = None) -> None:
         """Detect confirmed transitions and push them to subscribers.
 
-        A transition is confirmed when the model's ``now.status`` has matched
+        A transition is confirmed when the model's status has matched
         ``confirm_polls`` polls in a row *and* differs from the baseline. The
         first poll after ``initialize`` records the baseline silently so a
         restart doesn't fire a flood of stale changes.
@@ -477,47 +817,58 @@ class MirasimStatus(Star):
             ),
         )
 
-        grouped_now = self._all_models(data)
-        grouped_prev = self._all_models(prev_data) if prev_data else {}
+        grouped_now = _collect_models(data)
+        grouped_prev = _collect_models(prev_data) if prev_data else {}
 
         # First poll ever: just record the baseline, no pushes.
         if not self._states:
             self._states = {
-                f"{model_id}@{cohort_id}": _now_status_of(model)[0]
-                for model_id, entries in grouped_now.items()
-                for cohort_id, model, _a in entries
+                f"{key}@{cohort_id}": _model_status(model, data)[0]
+                for key, record in grouped_now.items()
+                for cohort_id, model, _agent in record["entries"]
             }
             await self.put_kv_data("states", self._states)
             return
 
-        changes: list[tuple[str, str, str, dict, dict, dict]] = []
+        changes: list[tuple[str, str, str, dict, dict, str]] = []
         dirty = False
-        for model_id, entries in grouped_now.items():
-            for cohort_id, model, agent in entries:
-                key = f"{model_id}@{cohort_id}"
-                current, _availability = _now_status_of(model)
-                previous_confirmed = self._states.get(key, current)
+        for key, record in grouped_now.items():
+            prev_record = grouped_prev.get(key)
+            prev_map = (
+                {cid: model for cid, model, _a in prev_record["entries"]}
+                if prev_record
+                else {}
+            )
+            for cohort_id, model, agent in record["entries"]:
+                change_key = f"{key}@{cohort_id}"
+                current, _availability = _model_status(model, data)
+                previous_confirmed = self._states.get(change_key, current)
 
-                # With confirm >= 2, the previous poll's now.status must also
-                # have equalled current; otherwise the change hasn't settled.
+                # With confirm >= 2, the previous poll's status must also have
+                # equalled current; otherwise the change hasn't settled.
                 if confirm >= 2:
-                    prev_entries = grouped_prev.get(model_id, [])
-                    prev_map = {c: m for c, m, _a in prev_entries}
                     prev_model = prev_map.get(cohort_id)
-                    if prev_model is None:
-                        previous_now = current  # model just appeared
-                    else:
-                        previous_now, _ = _now_status_of(prev_model)
+                    previous_now = (
+                        current
+                        if prev_model is None
+                        else _model_status(prev_model, prev_data)[0]
+                    )
                     if previous_now != current:
                         continue  # still flickering
 
                 if previous_confirmed == current:
                     continue
-                # Confirmed transition.
                 changes.append(
-                    (key, previous_confirmed, current, model, cohort_id, agent)
+                    (
+                        change_key,
+                        previous_confirmed,
+                        current,
+                        model,
+                        cohort_id,
+                        _format_reasons(agent.get("reasons")),
+                    )
                 )
-                self._states[key] = current
+                self._states[change_key] = current
                 dirty = True
 
         if not changes:
@@ -526,84 +877,24 @@ class MirasimStatus(Star):
             await self.put_kv_data("states", self._states)
         logger.info(f"[Mirasim] Status changes: {[k for k, *_ in changes]}")
 
-        cells_start = _parse_time(data.get("cellsStart"))
-        cell_seconds = data.get("cellSeconds")
-
         lines_by_key: list[tuple[str, str]] = []
-        for key, _old, new_status, model, cohort_id, agent in changes:
-            model_id = key.split("@", 1)[0]
-            icon = CHANGE_ICONS.get(new_status, "⚪")
-            label = COHORT_NAMES.get(cohort_id, cohort_id)
-            reason = _format_reasons(agent.get("reasons"))
-            latency = model.get("latency") or {}
-            _s, availability = _now_status_of(model)
-            availability_text = _fmt_rate(availability, short=True)
-
-            # Failure run inside the 24h cell window.
-            # - For "down" we want where the current down streak started.
-            # - For "ok" (recovery) we want the down streak that just ended.
-            bars = _history_bars(model.get("cells"), data)
-            outage_start: int | None = None
-            began_before = False
-            if bars:
-                target = new_status if new_status == "down" else "down"
-                i = len(bars) - 1
-                # Skip trailing cells that don't match the target streak.
-                while i >= 0 and bars[i] != target:
-                    i -= 1
-                # Walk back through the streak.
-                while i >= 0 and bars[i] == target:
-                    i -= 1
-                # i is now the last index NOT in the streak; streak starts at i+1.
-                if i + 1 < len(bars):
-                    outage_start = i + 1
-                    began_before = outage_start == 0 and bars[0] == target
-
-            if new_status == "down":
-                line = (
-                    f"{icon} {model_id}（{label}）异常 {reason}"
-                    f"（可用率 {availability_text}"
+        for change_key, _old, new_status, model, cohort_id, reason in changes:
+            lines_by_key.append(
+                (
+                    change_key,
+                    _change_line(
+                        new_status, model, cohort_id, reason, data, grouped_now
+                    ),
                 )
-                if (
-                    outage_start is not None
-                    and cells_start is not None
-                    and isinstance(cell_seconds, (int, float))
-                ):
-                    since = datetime.fromtimestamp(
-                        cells_start.timestamp() + outage_start * cell_seconds,
-                        tz=cells_start.tzinfo,
-                    )
-                    line += f"，{_fmt_time(since.isoformat())} 起"
-                line += "）"
-            elif new_status == "warn":
-                line = (
-                    f"{icon} {model_id}（{label}）不稳定 {reason}"
-                    f"（可用率 {availability_text}）"
-                )
-            elif new_status == "ok":
-                p50 = _fmt_seconds(latency.get("p50"))
-                line = (
-                    f"{icon} {model_id}（{label}）已恢复，"
-                    f"p50 {p50}，可用率 {availability_text}"
-                )
-                if outage_start is not None and isinstance(cell_seconds, (int, float)):
-                    # Cells between outage_start and the newest ok cell are the
-                    # failure run that just ended.
-                    outage_secs = (len(bars) - outage_start - 1) * cell_seconds
-                    if outage_secs > 0:
-                        outage = _fmt_duration(outage_secs)
-                        prefix = "超过" if began_before else "约"
-                        line += f"，异常持续{prefix} {outage}"
-            else:
-                line = f"{icon} {model_id}（{label}）{STATUS_NAMES.get(new_status, new_status)}"
-            lines_by_key.append((key, line))
+            )
 
         # Snapshot the sessions: a command may edit them while we await sends.
+        aliases = _model_aliases(grouped_now)
         for umo, wanted in list(self._subs.items()):
             lines = [
                 line
                 for key, line in lines_by_key
-                if any(_covers(e, key) for e in wanted)
+                if any(_covers(e, key, aliases) for e in wanted)
             ]
             if not lines:
                 continue
@@ -621,29 +912,27 @@ class MirasimStatus(Star):
         self,
         event: AstrMessageEvent,
         action: str = "",
-        target: str = "",
+        target: GreedyStr = "",
     ):
         """查看 Mirasim 模型状态，或管理本会话的状态推送订阅。"""
         act = action.strip().lower()
-        target = target.strip()
+        rest = target.strip()
         umo = event.unified_msg_origin
+        # Model names contain spaces ("opus 5.5"), so the whole argument tail is
+        # one string: a known verb takes it as its target, anything else is the
+        # model query itself.
+        query = " ".join(part for part in (action.strip(), rest) if part).strip()
 
-        if act in ("help", "帮助"):
+        if act in ("help", "帮助", "说明"):
             text = USAGE
         elif act in ("sub", "订阅"):
-            text = await self._subscribe(umo, target)
+            text = await self._subscribe(umo, rest)
         elif act in ("unsub", "取消订阅", "退订"):
-            text = await self._unsubscribe(umo, target)
+            text = await self._unsubscribe(umo, rest)
         elif act in ("list", "订阅列表"):
-            wanted = self._subs.get(umo, [])
-            if not wanted:
-                text = "本会话还没有订阅任何模型，发送 /mirasim sub <模型> 订阅。"
-            elif ALL_MODELS in wanted:
-                text = "本会话已订阅全部模型（包括之后新增的模型）。"
-            else:
-                text = f"本会话订阅了 {len(wanted)} 项：\n" + "\n".join(
-                    f"· {entry}" for entry in wanted
-                )
+            text = self._render_subscriptions(umo)
+        elif act in ("agents", "厂商", "厂商状态"):
+            text = await self._render_agents_view()
         else:
             try:
                 data = await self._fetch_status()
@@ -651,10 +940,10 @@ class MirasimStatus(Star):
                 logger.warning(f"[Mirasim] Status query failed: {exc!r}")
                 text = f"获取 Mirasim 状态失败：{str(exc) or type(exc).__name__}"
             else:
-                if act and act not in ALL_WORDS:
-                    text = self._render_model(data, action.strip())
+                if query and query.lower() not in ALL_WORDS:
+                    text = self._render_model(data, query)
                 else:
-                    show_all = bool(act)
+                    show_all = bool(query)
                     if self.config.get("render_image", True):
                         path = await self._render_overview_image(data, show_all)
                         if path:
@@ -662,6 +951,165 @@ class MirasimStatus(Star):
                             return
                     text = self._render_overview(data, show_all)
         yield event.plain_result(text)
+
+    def _render_subscriptions(self, umo: str) -> str:
+        """Describe what the session subscribed to.
+
+        Args:
+            umo: Unified message origin of the session.
+
+        Returns:
+            The reply text.
+        """
+        wanted = self._subs.get(umo, [])
+        if not wanted:
+            return "本会话还没有订阅任何模型，发送 /mirasim sub <模型> 订阅。"
+        if ALL_MODELS in wanted:
+            return "本会话已订阅全部模型（包括之后新增的模型）。"
+        return f"本会话订阅了 {len(wanted)} 项：\n" + "\n".join(
+            f"· {entry}" for entry in wanted
+        )
+
+    async def _render_agents_view(self) -> str:
+        """Render the per-vendor view built from each agent's summary block.
+
+        Returns:
+            The reply text.
+        """
+        try:
+            data = await self._fetch_status()
+        except Exception as exc:
+            logger.warning(f"[Mirasim] Status query failed: {exc!r}")
+            return f"获取 Mirasim 状态失败：{str(exc) or type(exc).__name__}"
+        lines = ["Mirasim 厂商状态"]
+        for record in _collect_agents(data).values():
+            lines.append(f"· {record['name']}")
+            for cohort_id, agent in record["entries"]:
+                status, availability = _agent_status(agent, data)
+                summary = agent.get("summary") or {}
+                window = _fmt_window((summary.get("now") or {}).get("window"))
+                p50 = _fmt_seconds((summary.get("latency") or {}).get("p50"))
+                detail = _fmt_rate(availability, short=True)
+                if p50 != "—":
+                    detail += f" · p50 {p50}"
+                if window:
+                    detail += f" · {window}"
+                reason = _reason_note(agent.get("reasons"))
+                lines.append(
+                    f"  {STATUS_ICONS.get(status, '❔')} "
+                    f"{COHORT_NAMES.get(cohort_id, cohort_id)} · {detail}" + reason
+                )
+        _append_footer(lines, data)
+        return "\n".join(lines)
+
+    def _overview_groups(
+        self, data: dict, show_all: bool
+    ) -> tuple[list[dict], list[str], bool]:
+        """Pick, filter and sort the models shown in the overview.
+
+        Each ``display_models`` entry is either a plain model name (shows every
+        cohort) or ``model@cohort`` (shows only that cohort). Plain names and
+        cohort-suffixed names may be mixed freely.
+
+        Args:
+            data: Status payload.
+            show_all: Ignore the ``display_models`` setting.
+
+        Returns:
+            ``(groups, missing, filtered)`` where each group is one vendor with
+            its models; problems sort first.
+        """
+        models = _collect_models(data)
+        aliases = _model_aliases(models)
+        configured = [
+            str(item).strip()
+            for item in self.config.get("display_models") or []
+            if str(item).strip()
+        ]
+        filtered = bool(configured) and not show_all
+        missing: list[str] = []
+        # chosen maps model key -> set of cohort_ids, or None meaning every cohort.
+        chosen: dict[str, set[str] | None] = {}
+        if filtered:
+            for raw in configured:
+                model_part, cohort_part = _split_target(raw)
+                if not model_part:
+                    continue
+                try:
+                    key = _resolve_key(list(models), model_part, "", aliases)
+                except LookupError:
+                    missing.append(raw)
+                    continue
+                # Already chose this model with no cohort filter: nothing changes.
+                if key in chosen and chosen[key] is None:
+                    continue
+                if cohort_part is None:
+                    chosen[key] = None
+                    continue
+                available = {c for c, _m, _a in models[key]["entries"]}
+                if cohort_part not in available:
+                    missing.append(raw)
+                    continue
+                bucket = chosen.get(key)
+                if bucket is None and key not in chosen:
+                    chosen[key] = {cohort_part}
+                elif bucket is not None:
+                    bucket.add(cohort_part)
+        else:
+            chosen = dict.fromkeys(models)
+
+        groups: dict[str, dict] = {}
+        for key, cohort_filter in chosen.items():
+            record = models[key]
+            entries = record["entries"]
+            if cohort_filter is not None:
+                entries = [e for e in entries if e[0] in cohort_filter]
+            if not entries:
+                continue
+            tagged = [
+                (_model_status(model, data)[0], (cohort_id, model, agent))
+                for cohort_id, model, agent in entries
+            ]
+            group = groups.setdefault(
+                record["agent_id"] or record["agent"],
+                {
+                    "agent": record["agent"],
+                    "agent_id": record["agent_id"],
+                    "models": [],
+                    "cohorts": [],
+                    "counts": {},
+                },
+            )
+            for cohort_id, _m, _a in entries:
+                if cohort_id not in group["cohorts"]:
+                    group["cohorts"].append(cohort_id)
+            group["models"].append(
+                {
+                    "key": key,
+                    "name": record["name"],
+                    "entries": tagged,
+                    "worst": _worst_status([s for s, _e in tagged]),
+                }
+            )
+
+        order = {cid: i for i, cid in enumerate(COHORT_ORDER)}
+        for group in groups.values():
+            for status, _entry in (
+                (s, e) for model in group["models"] for s, e in model["entries"]
+            ):
+                group["counts"][status] = group["counts"].get(status, 0) + 1
+            group["cohorts"].sort(key=lambda c: order.get(c, len(COHORT_ORDER)))
+            group["worst"] = _worst_status(
+                [model["worst"] for model in group["models"]]
+            )
+            group["total"] = sum(len(m["entries"]) for m in group["models"])
+            group["up"] = group["counts"].get("ok", 0)
+        ordered = list(groups.values())
+        if not filtered:
+            # No display_models configured: vendors with problems first. Model
+            # order inside a vendor stays as the payload lists it.
+            ordered.sort(key=lambda g: (STATUS_ORDER.get(g["worst"], 99), g["agent"]))
+        return ordered, missing, filtered
 
     def _render_overview(self, data: dict, show_all: bool) -> str:
         """Render the status list of the configured models, or of all of them.
@@ -673,120 +1121,29 @@ class MirasimStatus(Star):
         Returns:
             The reply text.
         """
-        rows, missing, filtered = self._overview_rows(data, show_all)
-        up = sum(
-            1
-            for _id, entries, _a in rows
-            for status, _entry in entries
-            if status == "ok"
-        )
-        total = sum(len(entries) for _id, entries, _a in rows)
-        lines = [f"Mirasim 模型状态 · 可用 {up}/{total}"]
-        if not rows:
+        groups, missing, filtered = self._overview_groups(data, show_all)
+        up = sum(g["up"] for g in groups)
+        total = sum(g["total"] for g in groups)
+        lines = [f"Mirasim 模型状态 · 正常 {up}/{total}"]
+        if not groups:
             lines.append("暂无模型数据。")
-        for model_id, entries, agent_name in rows:
-            agent_suffix = f" — {agent_name}" if agent_name else ""
-            lines.append(f"· {model_id}{agent_suffix}")
-            for status, (cohort_id, model, _agent) in entries:
-                availability = (model.get("now") or {}).get("availability")
-                p50 = (model.get("latency") or {}).get("p50")
-                detail = (
-                    f"{_fmt_rate(availability, short=True)} · p50 {_fmt_seconds(p50)}"
-                )
-                lines.append(
-                    f"  {STATUS_ICONS.get(status, '❔')} "
-                    f"{COHORT_NAMES.get(cohort_id, cohort_id)} · {detail}"
-                )
+        shown_cohorts: set[str] = set()
+        for group in groups:
+            lines.append(f"{group['agent']} · {group['up']}/{group['total']} 正常")
+            for model in group["models"]:
+                segments = []
+                for status, (cohort_id, m, _a) in model["entries"]:
+                    shown_cohorts.add(cohort_id)
+                    availability = _fmt_rate(_model_status(m, data)[1], short=True)
+                    segments.append(
+                        f"{STATUS_ICONS.get(status, '❔')}"
+                        f"{COHORT_NAMES.get(cohort_id, cohort_id)} {availability}"
+                    )
+                lines.append(f"· {model['name']} — {' · '.join(segments)}")
+        _append_footer(lines, data, filtered, cohorts=shown_cohorts)
         if missing:
             lines.append(f"未找到：{'、'.join(missing)}")
-        footer = f"检测于 {_fmt_time(data.get('generatedAt'))}"
-        cell_seconds = data.get("cellSeconds")
-        if isinstance(cell_seconds, (int, float)) and cell_seconds > 0:
-            footer += f" · 每 {_fmt_duration(cell_seconds)}一格"
-        lines.append(footer)
-        if filtered:
-            lines.append("仅展示配置的模型，发送 /mirasim all 查看全部。")
         return "\n".join(lines)
-
-    def _overview_rows(
-        self, data: dict, show_all: bool
-    ) -> tuple[
-        list[tuple[str, list[tuple[str, tuple[str, dict, dict]]], str]], list[str], bool
-    ]:
-        """Pick, filter and sort the models shown in the overview.
-
-        Each ``display_models`` entry is either a plain model ID (shows every
-        cohort) or ``model@cohort`` (shows only that cohort). Plain IDs and
-        cohort-suffixed IDs may be mixed freely.
-
-        Args:
-            data: Status payload.
-            show_all: Ignore the ``display_models`` setting.
-
-        Returns:
-            ``(model_id, entries, agent_name)`` rows with problems first. Each
-            entry in ``entries`` is ``(status, (cohort_id, model, agent))``.
-        """
-        all_models = self._all_models(data)
-        configured = [
-            str(item).strip()
-            for item in self.config.get("display_models") or []
-            if str(item).strip()
-        ]
-        filtered = bool(configured) and not show_all
-        missing: list[str] = []
-        # chosen maps model_id -> set of cohort_ids, or None meaning every cohort.
-        chosen: dict[str, set[str] | None] = {}
-        if filtered:
-            lowered = {k.lower(): k for k in all_models}
-            for raw in configured:
-                model_part, cohort_part = _split_target(raw)
-                if not model_part:
-                    continue
-                key = lowered.get(model_part.lower())
-                if key is None:
-                    missing.append(raw)
-                    continue
-                # Already chose this model with no cohort filter: nothing changes.
-                if chosen.get(key) is None and key in chosen:
-                    continue
-                if cohort_part is None:
-                    # Broaden (or re-broaden) to all cohorts.
-                    chosen[key] = None
-                    continue
-                # Validate the cohort against the payload.
-                available = {c for c, _m, _a in all_models[key]}
-                if cohort_part not in available:
-                    missing.append(raw)
-                    continue
-                # Accumulate cohorts under this model.
-                bucket = chosen.get(key)
-                if bucket is None:
-                    chosen[key] = {cohort_part}
-                else:
-                    bucket.add(cohort_part)
-        else:
-            chosen = dict.fromkeys(all_models)
-
-        rows: list[tuple[str, list[tuple[str, tuple[str, dict, dict]]], str, str]] = []
-        for model_id, cohort_filter in chosen.items():
-            entries = all_models[model_id]
-            if cohort_filter is not None:
-                entries = [e for e in entries if e[0] in cohort_filter]
-            tagged = [
-                (_now_status_of(model)[0], (cohort_id, model, agent))
-                for cohort_id, model, agent in entries
-            ]
-            if not tagged:
-                continue
-            worst = _worst_status([status for status, _e in tagged])
-            agent_name = entries[0][2].get("name") or ""
-            rows.append((model_id, tagged, agent_name, worst))
-        if not filtered:
-            # No display_models configured: problems first, then alphabetical.
-            # The user's explicit order wins when they wrote one.
-            rows.sort(key=lambda r: (STATUS_ORDER.get(r[3], 99), r[0]))
-        return [(m, e, a) for m, e, a, _w in rows], missing, filtered
 
     async def _render_overview_image(self, data: dict, show_all: bool) -> str | None:
         """Render the overview as a card image through AstrBot's T2I service.
@@ -799,65 +1156,72 @@ class MirasimStatus(Star):
             Path of the rendered image, or None when rendering failed and the
             caller should fall back to text.
         """
-        rows, missing, filtered = self._overview_rows(data, show_all)
+        groups, missing, filtered = self._overview_groups(data, show_all)
         counts: dict[str, int] = {}
-        groups = []
         total_up = 0
         total_rows = 0
-        for model_id, entries, agent_name in rows:
-            cards = []
-            for status, (cohort_id, model, agent) in entries:
-                counts[status] = counts.get(status, 0) + 1
-                total_rows += 1
-                if status == "ok":
-                    total_up += 1
-                availability = (model.get("now") or {}).get("availability")
-                p50 = (model.get("latency") or {}).get("p50")
-                metrics = (
-                    f"{_fmt_rate(availability, short=True)} · p50 {_fmt_seconds(p50)}"
-                )
-                if status == "down":
-                    note = _format_reasons(agent.get("reasons")) or "服务异常"
-                elif status == "warn":
-                    note = "可用率波动"
-                elif status == "nodata":
-                    note = "暂未采集到流量"
-                else:
-                    note = "运行正常"
-                bars = _history_bars(model.get("cells"), data)
-                cards.append(
-                    {
-                        "cohort": cohort_id,
-                        "cohort_label": COHORT_NAMES.get(cohort_id, cohort_id),
-                        "status": status if status in STATUS_ORDER else "unknown",
-                        "label": STATUS_NAMES.get(status, status),
-                        "metrics": metrics,
-                        "note": note,
-                        "history": bars,
-                    }
-                )
-            groups.append(
-                {
-                    "id": model_id,
-                    "agent": agent_name,
-                    "worst": _worst_status([c["status"] for c in cards]),
-                    "cards": cards,
-                }
-            )
+        for group in groups:
+            for status, count in group["counts"].items():
+                counts[status] = counts.get(status, 0) + count
+            total_up += group["up"]
+            total_rows += group["total"]
+
+        cohort_states = _cohort_state(data)
+        for group in groups:
+            for model in group["models"]:
+                cells = []
+                for cohort_id in group["cohorts"]:
+                    match = next(
+                        (
+                            (status, (cid, m, agent))
+                            for status, (cid, m, agent) in model["entries"]
+                            if cid == cohort_id
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        cells.append({"empty": True, "cohort": cohort_id})
+                        continue
+                    status, (cid, m, agent) = match
+                    availability = _model_status(m, data)[1]
+                    p50 = _fmt_seconds((m.get("latency") or {}).get("p50"))
+                    metrics = _fmt_rate(availability, short=True)
+                    if p50 != "—":
+                        metrics += f" · {p50}"
+                    note = _reason_note(agent.get("reasons"))
+                    cells.append(
+                        {
+                            "empty": False,
+                            "cohort": cid,
+                            "cohort_label": COHORT_NAMES.get(cid, cid),
+                            "status": status,
+                            "label": STATUS_NAMES.get(status, status),
+                            "metrics": metrics,
+                            "note": note,
+                            "history": _history_bars(m.get("cells"), data),
+                        }
+                    )
+                model["cells"] = cells
+
         interval = data.get("cellSeconds")
         tmpl_data = {
             "groups": groups,
             "counts": counts,
             "total_up": total_up,
             "total_rows": total_rows,
+            "cohort_states": cohort_states,
+            "cohort_names": COHORT_NAMES,
+            "status_names": STATUS_NAMES,
             "missing": missing,
             "filtered": filtered,
             "checked_at": _fmt_time(data.get("generatedAt")),
+            "through_at": _fmt_time(data.get("dataThrough")),
             "interval": (
                 _fmt_duration(interval)
                 if isinstance(interval, (int, float)) and interval > 0
                 else ""
             ),
+            "notes": [str(n) for n in (data.get("notes") or []) if str(n).strip()],
             "source": "mirasim.ai",
         }
 
@@ -889,29 +1253,38 @@ class MirasimStatus(Star):
         Returns:
             The reply text.
         """
-        model_id, entries, error = self._resolve_model_and_entry(data, query)
+        record, cohort_part, error = self._resolve_model_and_entry(data, query)
         if error:
             return error
-        _model_part, cohort_part = _split_target(query)
-        title = model_id + (f"@{cohort_part}" if cohort_part else "")
-        lines = [f"· {title}"]
+        title = record["name"] + (f"@{cohort_part}" if cohort_part else "")
+        agent = record["agent"]
+        lines = [f"· {title}" + (f"（{agent}）" if agent else "")]
 
-        for cohort_id, model, agent in entries:
+        for cohort_id, model, agent_blob in record["entries"]:
             label = COHORT_NAMES.get(cohort_id, cohort_id)
-            status, availability = _now_status_of(model)
+            status, availability = _model_status(model, data)
             icon = STATUS_ICONS.get(status, "❔")
             name = STATUS_NAMES.get(status, status)
-            reason = _format_reasons(agent.get("reasons"))
+            window = _fmt_window((model.get("now") or {}).get("window"))
             latency = model.get("latency") or {}
             availability_stats = model.get("availability") or {}
-            same_model = model.get("sameModel")
-            intel = model.get("intel")
 
             header = f"{icon} {label}池 {name}"
-            if status in ("down", "warn") and isinstance(availability, (int, float)):
-                header += f"（可用率 {_fmt_rate(availability, short=True)}）"
-            if reason:
-                header += f" {reason}"
+            # One parenthetical holding both the failure split and the current
+            # availability; two adjacent "（）" read as a typo.
+            extras = []
+            reason_text = _format_reasons(agent_blob.get("reasons"))
+            if reason_text:
+                extras.append(reason_text)
+            if status in ("down", "degraded") and isinstance(
+                availability, (int, float)
+            ):
+                rate = f"可用率 {_fmt_rate(availability, short=True)}"
+                if window:
+                    rate += f" · 最近 {window}"
+                extras.append(rate)
+            if extras:
+                header += f"（{' · '.join(extras)}）"
             lines.append(header)
 
             detail_bits = []
@@ -928,13 +1301,18 @@ class MirasimStatus(Star):
                     f"  可用率 24h {_fmt_rate(h24, short=True)} · "
                     f"7d {_fmt_rate(d7, short=True)}"
                 )
+            same_model = model.get("sameModel")
             if isinstance(same_model, (int, float)) and same_model < 100:
                 lines.append(f"  模型不匹配 {100 - same_model:.1f}%")
+            intel = model.get("intel")
             if isinstance(intel, dict):
                 swapped = intel.get("swapped")
                 cut = intel.get("cut")
+                mismatched = intel.get("mismatched")
                 if isinstance(swapped, (int, float)) and swapped:
                     lines.append(f"  路由切换 {swapped:.1f}%")
+                if isinstance(mismatched, (int, float)) and mismatched:
+                    lines.append(f"  响应不符 {mismatched:.1f}%")
                 if isinstance(cut, (int, float)) and cut:
                     lines.append(f"  提前截断 {cut:.1f}%")
 
@@ -951,65 +1329,61 @@ class MirasimStatus(Star):
                         lines.append(
                             f"  近 24h 曾异常（{_fmt_time(went_down.isoformat())}）"
                         )
-                stripe = "".join(
-                    {"ok": "🟩", "warn": "🟨", "down": "🟥", "unknown": "⬜"}[b]
-                    for b in bars
+                stripe = "".join(STRIPE_ICONS.get(b, "⬜") for b in bars)
+                lines.append(
+                    f"  近 24h（旧→新，每格 {_cell_width(data)}）：\n  {stripe}"
                 )
-                lines.append(f"  近 24h（旧→新，每格 30 分钟）：\n  {stripe}")
+        _append_footer(lines, data, cohorts={c for c, _m, _a in record["entries"]})
         return "\n".join(lines)
 
     def _resolve_model_and_entry(
         self, data: dict, target: str
-    ) -> tuple[str | None, list[tuple[str, dict, dict]] | None, str]:
+    ) -> tuple[dict | None, str | None, str]:
         """Resolve user input of ``model[@cohort]`` against the payload.
 
         Args:
             data: Status payload.
-            target: Raw user input, e.g. ``opus-5-5@paid``.
+            target: Raw user input, e.g. ``opus 5.5@paid``.
 
         Returns:
-            ``(model_id, entries, "")`` on hit, ``(None, None, error)`` on miss.
+            ``(record, cohort_part, "")`` on hit, ``(None, None, error)`` on miss.
         """
         model_part, cohort_part = _split_target(target)
-        all_models = self._all_models(data)
+        models = _collect_models(data)
         if not model_part:
             return None, None, "用法：/mirasim <模型>[@<free|paid|cloud>]"
         try:
-            model_id = _resolve_id(
-                list(all_models), model_part, "发送 /mirasim all 查看全部模型。"
+            key = _resolve_key(
+                list(models),
+                model_part,
+                "发送 /mirasim all 查看全部模型。",
+                _model_aliases(models),
             )
         except LookupError as exc:
             return None, None, str(exc)
-        entries = all_models[model_id]
+        record = dict(models[key])
+        entries = record["entries"]
         if cohort_part is None:
-            return model_id, entries, ""
-        matched_cohort: str | None = None
-        for cid, _m, _a in entries:
-            if cid.lower() == cohort_part:
-                matched_cohort = cid
-                break
-        if matched_cohort is None:
-            for cid, name in COHORT_NAMES.items():
-                if name == cohort_part and any(e[0] == cid for e in entries):
-                    matched_cohort = cid
-                    break
-        if matched_cohort is None:
+            return record, None, ""
+        matched = [e for e in entries if e[0].lower() == cohort_part]
+        if not matched:
             return (
                 None,
                 None,
                 (
-                    f"未知池「{cohort_part}」，{model_id} 可用："
+                    f"未知池「{cohort_part}」，{record['name']} 可用："
                     f"{'、'.join(f'{c}（{COHORT_NAMES.get(c, c)}）' for c, _m, _a in entries)}"
                 ),
             )
-        return model_id, [e for e in entries if e[0] == matched_cohort], ""
+        record["entries"] = matched
+        return record, matched[0][0], ""
 
     async def _subscribe(self, umo: str, target: str) -> str:
         """Subscribe a session to a model, one of its cohorts, or all models.
 
         Args:
             umo: Unified message origin of the session.
-            target: A model ID, ``model@cohort``, or one of ``ALL_WORDS``.
+            target: A model name, ``model@cohort``, or one of ``ALL_WORDS``.
 
         Returns:
             The reply text.
@@ -1029,34 +1403,35 @@ class MirasimStatus(Star):
         except Exception as exc:
             logger.warning(f"[Mirasim] Status query failed: {exc!r}")
             return f"获取 Mirasim 状态失败，暂时无法确认模型：{str(exc) or type(exc).__name__}"
-        model_id, entries, error = self._resolve_model_and_entry(data, target)
+        record, cohort_part, error = self._resolve_model_and_entry(data, target)
         if error:
             return error
-        _model_part, cohort_part = _split_target(target)
-        entry = f"{model_id}@{cohort_part}" if cohort_part else model_id
+        entry = f"{record['key']}@{cohort_part}" if cohort_part else record["key"]
         if entry in wanted:
-            return f"本会话已订阅 {entry}。"
+            return f"本会话已订阅 {record['name']}{f'@{cohort_part}' if cohort_part else ''}。"
 
         # Check whether an existing subscription already covers this target.
-        sample_keys = [f"{model_id}@{c}" for c, _m, _a in entries]
-        if any(_covers(e, k) for e in wanted for k in sample_keys):
+        sample_keys = [f"{record['key']}@{c}" for c, _m, _a in record["entries"]]
+        aliases = _model_aliases(_collect_models(data))
+        if any(_covers(e, k, aliases) for e in wanted for k in sample_keys):
             return "本会话的现有订阅已覆盖该目标。"
 
         self._subs[umo] = [*wanted, entry]
         await self.put_kv_data("subscriptions", self._subs)
 
         if cohort_part:
-            cohort_id, model, _a = entries[0]
-            status, _ = _now_status_of(model)
+            cohort_id, model, _a = record["entries"][0]
+            status, _ = _model_status(model, data)
             return (
-                f"已订阅 {model_id}@{cohort_id}（{COHORT_NAMES.get(cohort_id, cohort_id)}池，"
+                f"已订阅 {record['name']}@{cohort_id}"
+                f"（{COHORT_NAMES.get(cohort_id, cohort_id)}池，"
                 f"当前 {STATUS_ICONS.get(status, '❔')} {STATUS_NAMES.get(status, status)}），"
                 "状态变化时会推送到本会话。"
             )
-        statuses = [_now_status_of(m)[0] for _c, m, _a in entries]
+        statuses = [_model_status(m, data)[0] for _c, m, _a in record["entries"]]
         worst = _worst_status(statuses)
         return (
-            f"已订阅 {model_id} 的全部 {len(entries)} 个池"
+            f"已订阅 {record['name']} 的全部 {len(record['entries'])} 个池"
             f"（当前最差 {STATUS_ICONS.get(worst, '❔')} {STATUS_NAMES.get(worst, worst)}），"
             "状态变化时会推送到本会话。"
         )
@@ -1086,26 +1461,25 @@ class MirasimStatus(Star):
             return "本会话订阅的是全部模型，发送 /mirasim unsub all 取消。"
 
         model_part, cohort_part = _split_target(target)
+        needle = _slug(model_part)
+        # The stored entry may still carry the old vendor-prefixed name, so the
+        # aliases decide whether it names the same model as the input.
+        try:
+            aliases = _model_aliases(_collect_models(await self._fetch_status()))
+        except Exception:
+            aliases = {}
         matched = [
             e
             for e in wanted
-            if _split_target(e)[0].lower() == model_part.lower()
-            and (
-                cohort_part is None
-                or (_split_target(e)[1] or "") == cohort_part.lower()
+            if (
+                _slug(_split_target(e)[0]) == needle
+                or aliases.get(_slug(_split_target(e)[0])) == needle
             )
+            and (cohort_part is None or _split_target(e)[1] == cohort_part)
         ]
         if not matched:
             hint = "发送 /mirasim list 查看本会话的订阅。"
-            try:
-                data = await self._fetch_status()
-            except Exception:
-                return f"本会话没有订阅「{target}」，{hint}"
-            try:
-                resolved = _resolve_id(list(self._all_models(data)), model_part, hint)
-                return f"本会话没有订阅 {resolved}，{hint}"
-            except LookupError:
-                return f"本会话没有订阅「{target}」，{hint}"
+            return f"本会话没有订阅「{target}」，{hint}"
 
         remaining = [e for e in wanted if e not in matched]
         if remaining:
@@ -1114,3 +1488,118 @@ class MirasimStatus(Star):
             self._subs.pop(umo, None)
         await self.put_kv_data("subscriptions", self._subs)
         return f"已取消订阅 {'、'.join(matched)}。"
+
+
+def _cell_width(data: dict) -> str:
+    """Describe one history cell's width for the stripe caption.
+
+    Args:
+        data: Status payload.
+
+    Returns:
+        Text such as ``30分钟``; ``一格`` when the payload has no interval.
+    """
+    seconds = data.get("cellSeconds")
+    if isinstance(seconds, (int, float)) and seconds > 0:
+        return _fmt_duration(seconds)
+    return "一格"
+
+
+def _append_footer(
+    lines: list[str],
+    data: dict,
+    filtered: bool = False,
+    cohorts: object = None,
+) -> None:
+    """Append the timestamp / interval footer to a text reply.
+
+    Args:
+        lines: Reply lines being assembled, modified in place.
+        data: Status payload.
+        filtered: True when only configured models are shown.
+        cohorts: Cohort IDs to report pool states for; None means all of them.
+    """
+    checked_at = _fmt_time(data.get("generatedAt"))
+    footer = f"检测于 {checked_at}"
+    through = _fmt_time(data.get("dataThrough"))
+    if through != "—" and through != checked_at:
+        footer += f" · 数据截至 {through}"
+    seconds = data.get("cellSeconds")
+    if isinstance(seconds, (int, float)) and seconds > 0:
+        footer += f" · 每 {_fmt_duration(seconds)}一格"
+    lines.append(footer)
+    states = _cohort_state(data)
+    if isinstance(cohorts, (set, list, tuple)):
+        states = {c: s for c, s in states.items() if c in cohorts}
+    if states:
+        lines.append(
+            "池状态："
+            + " · ".join(
+                f"{COHORT_NAMES.get(cid, cid)} {STATUS_NAMES.get(state, state)}"
+                for cid, state in states.items()
+            )
+        )
+    for note in data.get("notes") or []:
+        text = str(note).strip()
+        if text:
+            lines.append(f"注：{text}")
+    if filtered:
+        lines.append("仅展示配置的模型，发送 /mirasim all 查看全部。")
+
+
+def _change_line(
+    new_status: str,
+    model: dict,
+    cohort_id: str,
+    reason: str,
+    data: dict,
+    models: dict[str, dict],
+) -> str:
+    """Build one push line describing a confirmed transition.
+
+    Args:
+        new_status: Status the model just settled into.
+        model: Model dict from the current payload.
+        cohort_id: Cohort the model belongs to.
+        reason: Bare agent failure breakdown text (``限流79%·故障21%``), or empty.
+        data: Whole payload, for cell timing.
+        models: Model index of the current payload, for the display name.
+
+    Returns:
+        One line of push text.
+    """
+    key = _slug(model.get("name")) or _slug(model.get("id"))
+    name = (models.get(key) or {}).get("name") or key
+    label = COHORT_NAMES.get(cohort_id, cohort_id)
+    icon = CHANGE_ICONS.get(new_status, "⚪")
+    _status, availability = _model_status(model, data)
+    availability_text = _fmt_rate(availability, short=True)
+    bars = _history_bars(model.get("cells"), data)
+    cell_seconds = data.get("cellSeconds")
+
+    tail = f" · {reason}" if reason else ""
+
+    if new_status == "down":
+        line = f"{icon} {name}（{label}）异常（可用率 {availability_text}"
+        streak = _last_streak(bars, ("down",))
+        if streak and isinstance(cell_seconds, (int, float)):
+            since = _cell_time(data, streak[0])
+            if since is not None:
+                line += f"，{_fmt_time(since.isoformat())} 起"
+        return line + "）" + tail
+
+    if new_status == "degraded":
+        return f"{icon} {name}（{label}）降级（可用率 {availability_text}）" + tail
+
+    if new_status == "ok":
+        p50 = _fmt_seconds((model.get("latency") or {}).get("p50"))
+        line = f"{icon} {name}（{label}）已恢复，p50 {p50}，可用率 {availability_text}"
+        streak = _last_streak(bars, ("down", "degraded"))
+        if streak and isinstance(cell_seconds, (int, float)):
+            outage_secs = streak[1] * cell_seconds
+            if outage_secs > 0:
+                prefix = "超过" if streak[0] == 0 else "约"
+                line += f"，异常持续{prefix} {_fmt_duration(outage_secs)}"
+        return line + tail
+
+    return f"{icon} {name}（{label}）{STATUS_NAMES.get(new_status, new_status)}"

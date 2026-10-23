@@ -4,6 +4,10 @@ Run from the AstrBot root so the plugin imports by its package path. Point
 ASTRBOT_ROOT elsewhere so importing astrbot.core leaves the real data/ alone:
     ASTRBOT_ROOT=/tmp/mirasim_test uv run python -m unittest \
         data.plugins.astrbot_plugin_mirasim_status.tests.test_main
+
+The fixtures mirror the real payload: ``id`` is only unique inside one agent
+(``m1``..``m6`` repeat), the display name is the identity, and the thresholds
+block ships with the document.
 """
 
 import asyncio
@@ -12,7 +16,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import jinja2
 
@@ -31,9 +35,9 @@ def iso(hours: float) -> str:
 
 
 def make_model(
-    model_id: str,
     name: str,
     *,
+    model_id: str = "m1",
     status: str = "ok",
     availability: float | None = 100.0,
     p50: float | None = 5.0,
@@ -42,6 +46,7 @@ def make_model(
     cells: list[int] | None = None,
     same_model: int = 100,
     intel: dict | None = None,
+    window: str | None = None,
 ) -> dict:
     """Build one model entry mirasim.ai-style (a value-per-cell array)."""
     if cells is None:
@@ -49,11 +54,11 @@ def make_model(
     return {
         "id": model_id,
         "name": name,
-        "now": {"status": status, "availability": availability, "window": "15m"},
+        "now": {"status": status, "availability": availability, "window": window},
         "availability": {"h24": h24, "d7": d7},
-        "latency": {"p50": p50, "p95": (p50 * 6 if p50 is not None else None)},
+        "latency": {"p50": p50, "p95": None},
         "sameModel": same_model,
-        "intel": intel,
+        "intel": intel or {"full": 100.0, "swapped": 0, "mismatched": 0, "cut": 0},
         "cells": cells,
         "merged": [],
     }
@@ -65,6 +70,7 @@ def make_agent(
     models: list[dict],
     *,
     reasons: list[dict] | None = None,
+    state: str = "ok",
 ) -> dict:
     """Wrap models under an agent blob; agent summary mirrors the first model."""
     summary = dict(models[0]) if models else {}
@@ -76,6 +82,7 @@ def make_agent(
         "summary": summary,
         "models": models,
         "reasons": reasons,
+        "state": state,
     }
 
 
@@ -85,6 +92,8 @@ def make_payload(
     agents_paid: list[dict] | None = None,
     agents_cloud: list[dict] | None = None,
     generated_h: float = 24.0,
+    thresholds: dict | None = None,
+    notes: list | None = None,
 ) -> dict:
     """Build the full status payload from per-cohort agent lists."""
     return {
@@ -93,8 +102,8 @@ def make_payload(
         "dataThrough": iso(generated_h),
         "cellSeconds": 1800,
         "cellsStart": iso(0),
-        "thresholds": {"good": 99, "warn": 95, "minTurns": 20},
-        "notes": [],
+        "thresholds": thresholds or {"good": 99, "warn": 95, "minTurns": 20},
+        "notes": notes or [],
         "cohorts": [
             {"id": "free", "state": "ok", "agents": agents_free or []},
             {"id": "paid", "state": "ok", "agents": agents_paid or []},
@@ -103,12 +112,16 @@ def make_payload(
     }
 
 
+class _Context:
+    """Minimal stand-in for AstrBot's Context; only send_message is used."""
+
+    def __init__(self) -> None:
+        self.send_message = AsyncMock(return_value=True)
+
+
 def make_plugin(**config) -> MirasimStatus:
-    context = MagicMock()
-    context.send_message = AsyncMock(return_value=True)
-    # Text replies by default, so no test reaches the real T2I service.
     plugin = MirasimStatus(
-        context, {"confirm_samples": 2, "render_image": False, **config}
+        _Context(), {"confirm_samples": 2, "render_image": False, **config}
     )
     plugin.put_kv_data = AsyncMock()
     plugin.get_kv_data = AsyncMock(side_effect=lambda key, default: default)
@@ -129,7 +142,7 @@ def sent_messages(plugin: MirasimStatus) -> dict[str, str]:
 
 
 async def command(plugin: MirasimStatus, *args: str, umo: str = "qq:GroupMessage:1"):
-    event = MagicMock()
+    event = AsyncMock()
     event.unified_msg_origin = umo
     event.plain_result = lambda text: text
     event.image_result = lambda path: ("image", path)
@@ -137,149 +150,338 @@ async def command(plugin: MirasimStatus, *args: str, umo: str = "qq:GroupMessage
     return replies[0]
 
 
-class ResolveIdTest(unittest.TestCase):
-    IDS = ["claude-opus-5", "claude-opus-5-5", "claude-sonnet-5-5", "kimi-k3"]
+class SlugTest(unittest.TestCase):
+    """Model names carry dots and spaces; the key is a slug of the name."""
 
-    def test_exact_match_beats_longer_ids_containing_it(self):
-        self.assertEqual(
-            main_mod._resolve_id(self.IDS, "claude-opus-5", ""), "claude-opus-5"
-        )
+    def test_names_slug_to_stable_keys(self):
+        self.assertEqual(main_mod._slug("opus 5.5"), "opus-5-5")
+        self.assertEqual(main_mod._slug("gpt-6.1-sol"), "gpt-6-1-sol")
+        self.assertEqual(main_mod._slug("Gemini 4 Argon"), "gemini-4-argon")
+        self.assertEqual(main_mod._slug("GLM-5.3-Flash"), "glm-5-3-flash")
 
-    def test_unique_part_and_case_are_forgiven(self):
-        self.assertEqual(main_mod._resolve_id(self.IDS, "KIMI", ""), "kimi-k3")
-        self.assertEqual(
-            main_mod._resolve_id(self.IDS, "opus-5-5", ""), "claude-opus-5-5"
-        )
-
-    def test_ambiguous_input_lists_the_candidates(self):
-        with self.assertRaises(LookupError) as ctx:
-            main_mod._resolve_id(self.IDS, "5-5", "")
-        self.assertIn("claude-opus-5-5、claude-sonnet-5-5", str(ctx.exception))
+    def test_empty_and_non_string_input(self):
+        self.assertEqual(main_mod._slug(None), "")
+        self.assertEqual(main_mod._slug("  "), "")
+        self.assertEqual(main_mod._slug("!!!"), "")
 
 
-class CellStatusTest(unittest.TestCase):
-    """The plugin uses 65/30 thresholds: 65% is usable, <30% is a real outage."""
+class CollectModelsTest(unittest.TestCase):
+    """The payload's ``id`` repeats per agent, so grouping must use the name."""
 
-    def test_per_threshold_bucket(self):
-        # 65% availability (650/1000) and above counts as 正常.
-        self.assertEqual(main_mod._cell_status(1000, 65, 30), "ok")
-        self.assertEqual(main_mod._cell_status(650, 65, 30), "ok")
-        # 30–64.9% is 不稳定.
-        self.assertEqual(main_mod._cell_status(649, 65, 30), "warn")
-        self.assertEqual(main_mod._cell_status(500, 65, 30), "warn")
-        self.assertEqual(main_mod._cell_status(300, 65, 30), "warn")
-        # Below 30% is 异常.
-        self.assertEqual(main_mod._cell_status(299, 65, 30), "down")
-        self.assertEqual(main_mod._cell_status(0, 65, 30), "down")
-
-    def test_gap_is_unknown(self):
-        self.assertEqual(main_mod._cell_status(-1, 65, 30), "unknown")
-        self.assertEqual(main_mod._cell_status(None, 65, 30), "unknown")
-
-    def test_history_bars_use_loose_plugin_thresholds(self):
-        """A model at 70% availability shows as 正常 despite the site warning."""
-        cells = [700] * 48  # 70% everywhere — site says down, plugin says ok.
-        data = make_payload(
-            agents_free=[make_agent("a", "A", [make_model("m", "m", cells=cells)])],
-        )
-        bars = main_mod._history_bars(cells, data)
-        self.assertEqual(bars, ["ok"] * 48)
-
-
-class NowStatusTest(unittest.TestCase):
-    """The plugin derives status from availability, not from now.status."""
-
-    def _model(self, status: str, availability: float) -> dict:
-        return make_model("m", "m", status=status, availability=availability)
-
-    def test_site_warn_but_plugin_ok(self):
-        # Site would say warn at 70%, plugin says ok (70 >= 65).
-        model = self._model("warn", 70.0)
-        self.assertEqual(main_mod._now_status_of(model), ("ok", 70.0))
-
-    def test_site_down_but_plugin_warn(self):
-        # Site would say down at 50%, plugin says warn (30 ≤ 50 < 65).
-        model = self._model("down", 50.0)
-        self.assertEqual(main_mod._now_status_of(model), ("warn", 50.0))
-
-    def test_really_down(self):
-        model = self._model("down", 20.0)
-        self.assertEqual(main_mod._now_status_of(model), ("down", 20.0))
-
-    def test_no_data(self):
-        model = self._model("down", None)
-        # availability=None → nodata
-        model["now"]["availability"] = None
-        self.assertEqual(main_mod._now_status_of(model)[0], "nodata")
-
-
-class ChangeDetectionTest(unittest.TestCase):
-    """The plugin watches now.status across two consecutive polls."""
-
-    def _payload_with(self, model_states: dict[str, str]) -> dict:
-        """One Claude model across all three pools in the given states."""
+    def payload(self) -> dict:
+        # Both agents call their first model "m1"; only the name tells them apart.
         return make_payload(
+            agents_free=[
+                make_agent("claude-code", "Claude", [make_model("opus 5.5", model_id="m1")]),
+                make_agent("codex", "GPT", [make_model("gpt-6-astra", model_id="m1")]),
+            ],
+            agents_paid=[
+                make_agent("claude-code", "Claude", [make_model("opus 5.5", model_id="m1")]),
+                make_agent("codex", "GPT", [make_model("gpt-6-astra", model_id="m1")]),
+            ],
+            agents_cloud=[],
+        )
+
+    def test_colliding_ids_stay_separate_models(self):
+        models = main_mod._collect_models(self.payload())
+        self.assertEqual(sorted(models), ["gpt-6-astra", "opus-5-5"])
+        self.assertEqual(len(models["opus-5-5"]["entries"]), 2)
+        self.assertEqual(models["opus-5-5"]["agent"], "Claude")
+        self.assertEqual(models["gpt-6-astra"]["agent"], "GPT")
+
+    def test_entries_are_ordered_by_cohort(self):
+        models = main_mod._collect_models(self.payload())
+        cohorts = [c for c, _m, _a in models["opus-5-5"]["entries"]]
+        self.assertEqual(cohorts, ["free", "paid"])
+
+    def test_missing_name_falls_back_to_id(self):
+        data = make_payload(
+            agents_free=[make_agent("a", "A", [make_model("", model_id="only-id")])]
+        )
+        models = main_mod._collect_models(data)
+        self.assertIn("only-id", models)
+
+
+class StatusReadingTest(unittest.TestCase):
+    """``now.status`` is authoritative; availability only fills gaps."""
+
+    def test_known_statuses_are_taken_verbatim(self):
+        for raw in ("ok", "degraded", "down"):
+            model = make_model("m", status=raw, availability=50.0)
+            self.assertEqual(main_mod._model_status(model)[0], raw)
+
+    def test_status_vocabulary_aliases(self):
+        for raw, expected in (
+            ("good", "ok"),
+            ("warn", "degraded"),
+            ("warning", "degraded"),
+            ("outage", "down"),
+            ("no_data", "nodata"),
+        ):
+            model = make_model("m", status=raw, availability=90.0)
+            self.assertEqual(main_mod._model_status(model)[0], expected)
+
+    def test_unknown_status_falls_back_to_payload_thresholds(self):
+        data = make_payload(thresholds={"good": 99, "warn": 95})
+        cases = {
+            100.0: "ok",
+            99.0: "ok",
+            98.9: "degraded",
+            95.0: "degraded",
+            94.9: "down",
+            60.0: "down",
+        }
+        for availability, expected in cases.items():
+            model = make_model("m", status="weird", availability=availability)
+            self.assertEqual(
+                main_mod._model_status(model, data)[0], expected, availability
+            )
+
+    def test_missing_availability_is_nodata(self):
+        model = make_model("m", status="weird", availability=None)
+        self.assertEqual(main_mod._model_status(model)[0], "nodata")
+
+    def test_thresholds_block_is_honoured(self):
+        data = make_payload(thresholds={"good": 80, "warn": 60})
+        model = make_model("m", status="weird", availability=70.0)
+        self.assertEqual(main_mod._model_status(model, data)[0], "degraded")
+
+    def test_missing_thresholds_block_uses_defaults(self):
+        good, warn, min_turns = main_mod._thresholds({"cohorts": []})
+        self.assertEqual((good, warn), (99.0, 95.0))
+        self.assertIsNone(min_turns)
+
+    def test_inverted_thresholds_are_clamped(self):
+        good, warn, _ = main_mod._thresholds({"thresholds": {"good": 90, "warn": 99}})
+        self.assertEqual((good, warn), (90.0, 90.0))
+
+    def test_agent_status_prefers_its_summary(self):
+        data = make_payload(
             agents_free=[
                 make_agent(
                     "claude-code",
                     "Claude",
-                    [
-                        make_model(
-                            "claude-opus-5-5",
-                            "opus 5.5",
-                            status=model_states["free"],
-                            availability=0.0
-                            if model_states["free"] == "down"
-                            else 100.0,
-                        )
-                    ],
+                    [make_model("opus 5.5", status="ok", availability=100.0)],
+                    state="degraded",
                 )
-            ],
-            agents_paid=[
+            ]
+        )
+        agent = data["cohorts"][0]["agents"][0]
+        # summary mirrors the first model, so it also says ok here.
+        self.assertEqual(main_mod._agent_status(agent, data)[0], "ok")
+
+    def test_agent_status_falls_back_to_models(self):
+        agent = {"id": "a", "name": "A", "summary": {}, "models": [make_model("m")]}
+        self.assertEqual(main_mod._agent_status(agent)[0], "ok")
+
+
+class HistoryTest(unittest.TestCase):
+    """Cells hold availability ×10 and are bucketed by the payload thresholds."""
+
+    def test_cell_buckets(self):
+        self.assertEqual(main_mod._cell_status(1000, 99, 95), "ok")
+        self.assertEqual(main_mod._cell_status(990, 99, 95), "ok")
+        self.assertEqual(main_mod._cell_status(989, 99, 95), "degraded")
+        self.assertEqual(main_mod._cell_status(950, 99, 95), "degraded")
+        self.assertEqual(main_mod._cell_status(949, 99, 95), "down")
+        self.assertEqual(main_mod._cell_status(-1, 99, 95), "unknown")
+        self.assertEqual(main_mod._cell_status(None, 99, 95), "unknown")
+
+    def test_history_bars_use_payload_thresholds(self):
+        cells = [700] * 48  # 70% everywhere: under the site's own 99/95.
+        data = make_payload(thresholds={"good": 99, "warn": 95})
+        self.assertEqual(main_mod._history_bars(cells, data), ["down"] * 48)
+
+    def test_worst_status_ordering(self):
+        self.assertEqual(main_mod._worst_status(["ok", "down"]), "down")
+        self.assertEqual(main_mod._worst_status(["ok", "degraded"]), "degraded")
+        self.assertEqual(main_mod._worst_status([]), "unknown")
+
+    def test_last_streak_locates_the_trailing_run(self):
+        bars = ["ok"] * 10 + ["down"] * 3 + ["ok"] * 2
+        self.assertEqual(main_mod._last_streak(bars, ("down",)), (10, 3))
+        self.assertEqual(main_mod._last_streak(["ok"] * 4, ("down",)), None)
+
+
+class FormatTest(unittest.TestCase):
+    def test_rate_and_seconds(self):
+        self.assertEqual(main_mod._fmt_rate(100.0, short=True), "100%")
+        self.assertEqual(main_mod._fmt_rate(97.94), "97.9%")
+        self.assertEqual(main_mod._fmt_rate(None), "—")
+        self.assertEqual(main_mod._fmt_seconds(4.14), "4.1s")
+        self.assertEqual(main_mod._fmt_seconds(None), "—")
+
+    def test_duration_drops_empty_units(self):
+        self.assertEqual(main_mod._fmt_duration(3600), "1小时")
+        self.assertEqual(main_mod._fmt_duration(5400), "1小时30分钟")
+        self.assertEqual(main_mod._fmt_duration(86400), "1天")
+        self.assertEqual(main_mod._fmt_duration(90), "1分钟")
+
+    def test_window_units(self):
+        self.assertEqual(main_mod._fmt_window("15m"), "15分钟")
+        self.assertEqual(main_mod._fmt_window("1h"), "1小时")
+        self.assertEqual(main_mod._fmt_window(None), "")
+        self.assertEqual(main_mod._fmt_window("weird"), "weird")
+
+    def test_reasons_render_bare_then_bracketed(self):
+        reasons = [
+            {"class": "capacity", "share": 98},
+            {"class": "outage", "share": 2},
+            {"class": "throttle", "share": 0},
+        ]
+        self.assertEqual(main_mod._format_reasons(reasons), "容量不足98%·故障2%")
+        self.assertEqual(main_mod._reason_note(reasons), "（容量不足98%·故障2%）")
+        self.assertEqual(main_mod._format_reasons(None), "")
+
+
+class ResolveKeyTest(unittest.TestCase):
+    KEYS = ["opus-5", "opus-5-5", "sonnet-5-5", "k3", "gpt-6-astra"]
+
+    def test_exact_match_beats_longer_keys(self):
+        self.assertEqual(main_mod._resolve_key(self.KEYS, "opus-5", ""), "opus-5")
+
+    def test_spaces_and_dots_are_forgiven(self):
+        self.assertEqual(main_mod._resolve_key(self.KEYS, "opus 5.5", ""), "opus-5-5")
+        self.assertEqual(main_mod._resolve_key(self.KEYS, "OPUS 5", ""), "opus-5")
+
+    def test_ambiguous_input_lists_the_candidates(self):
+        with self.assertRaises(LookupError) as ctx:
+            main_mod._resolve_key(self.KEYS, "opus", "")
+        self.assertIn("opus-5、opus-5-5", str(ctx.exception))
+
+    def test_unknown_input_is_reported(self):
+        with self.assertRaises(LookupError) as ctx:
+            main_mod._resolve_key(self.KEYS, "claude-opus", "看全部。")
+        self.assertIn("看全部。", str(ctx.exception))
+
+
+class LegacyNameTest(unittest.TestCase):
+    """The old vendor-prefixed names still resolve to the current keys."""
+
+    def setUp(self):
+        self.data = make_payload(
+            agents_free=[
+                make_agent(
+                    "claude-code",
+                    "Claude",
+                    [make_model("opus 5.5"), make_model("sonnet 5.5")],
+                ),
+                make_agent("gemini-cli", "Gemini", [make_model("Gemini 4 Argon")]),
+            ]
+        )
+        self.models = main_mod._collect_models(self.data)
+        self.aliases = main_mod._model_aliases(self.models)
+
+    def test_aliases_carry_the_vendor_prefix(self):
+        self.assertEqual(self.aliases["claude-opus-5-5"], "opus-5-5")
+        self.assertEqual(self.aliases["claude-sonnet-5-5"], "sonnet-5-5")
+        self.assertEqual(self.aliases["gemini-gemini-4-argon"], "gemini-4-argon")
+
+    def test_alias_resolves_the_old_spelling(self):
+        keys = list(self.models)
+        self.assertEqual(
+            main_mod._resolve_key(keys, "claude-opus-5-5", "", self.aliases),
+            "opus-5-5",
+        )
+        self.assertEqual(
+            main_mod._resolve_key(keys, "Claude Opus 5.5", "", self.aliases),
+            "opus-5-5",
+        )
+
+    def test_current_names_still_win(self):
+        keys = list(self.models)
+        self.assertEqual(
+            main_mod._resolve_key(keys, "opus-5-5", "", self.aliases), "opus-5-5"
+        )
+
+    def test_old_subscription_covers_the_new_change_key(self):
+        self.assertTrue(
+            main_mod._covers("claude-opus-5-5", "opus-5-5@free", self.aliases)
+        )
+        self.assertTrue(
+            main_mod._covers("claude-opus-5-5@paid", "opus-5-5@paid", self.aliases)
+        )
+        self.assertFalse(
+            main_mod._covers("claude-opus-5-5@paid", "opus-5-5@free", self.aliases)
+        )
+        self.assertFalse(
+            main_mod._covers("claude-sonnet-5-5", "opus-5-5@free", self.aliases)
+        )
+
+    def test_display_models_accepts_the_old_spelling(self):
+        plugin = make_plugin(display_models=["claude-opus-5-5"])
+        plugin._fetch_status = AsyncMock(return_value=self.data)
+        groups, missing, filtered = plugin._overview_groups(self.data, show_all=False)
+        self.assertTrue(filtered)
+        self.assertEqual(missing, [])
+        self.assertEqual([g["agent"] for g in groups], ["Claude"])
+        self.assertEqual([m["key"] for m in groups[0]["models"]], ["opus-5-5"])
+
+
+class TargetSplitTest(unittest.TestCase):
+    def test_plain_and_suffixed_forms(self):
+        self.assertEqual(main_mod._split_target("opus 5.5"), ("opus 5.5", None))
+        self.assertEqual(main_mod._split_target("opus 5.5@paid"), ("opus 5.5", "paid"))
+
+    def test_cohort_aliases_are_normalised(self):
+        self.assertEqual(main_mod._split_target("k3@订阅")[1], "paid")
+        self.assertEqual(main_mod._split_target("k3@云端")[1], "cloud")
+        self.assertEqual(main_mod._split_target("k3@免费")[1], "free")
+        self.assertEqual(main_mod._split_target("k3@体验")[1], "free")
+
+    def test_trailing_at_is_ignored(self):
+        self.assertEqual(main_mod._split_target("k3@"), ("k3", None))
+
+    def test_covers_matches_model_and_cohort(self):
+        self.assertTrue(main_mod._covers("*", "opus-5-5@free"))
+        self.assertTrue(main_mod._covers("opus-5-5", "opus-5-5@free"))
+        self.assertTrue(main_mod._covers("opus-5-5@paid", "opus-5-5@paid"))
+        self.assertFalse(main_mod._covers("opus-5-5@paid", "opus-5-5@free"))
+        self.assertFalse(main_mod._covers("k3", "opus-5-5@free"))
+
+
+class ChangeDetectionTest(unittest.TestCase):
+    """The plugin watches status across two consecutive polls."""
+
+    def _payload_with(self, states: dict[str, str]) -> dict:
+        """One Claude model across all three pools in the given states."""
+        availability = {
+            "ok": 100.0,
+            "degraded": 97.5,
+            "down": 40.0,
+        }
+        agents = {}
+        for cohort in ("free", "paid", "cloud"):
+            agents[cohort] = [
                 make_agent(
                     "claude-code",
                     "Claude",
                     [
                         make_model(
-                            "claude-opus-5-5",
                             "opus 5.5",
-                            status=model_states["paid"],
-                            availability=0.0
-                            if model_states["paid"] == "down"
-                            else 100.0,
+                            status=states[cohort],
+                            availability=availability[states[cohort]],
                         )
                     ],
                 )
-            ],
-            agents_cloud=[
-                make_agent(
-                    "claude-code",
-                    "Claude",
-                    [
-                        make_model(
-                            "claude-opus-5-5",
-                            "opus 5.5",
-                            status=model_states["cloud"],
-                            availability=0.0
-                            if model_states["cloud"] == "down"
-                            else 100.0,
-                        )
-                    ],
-                )
-            ],
+            ]
+        return make_payload(
+            agents_free=agents["free"],
+            agents_paid=agents["paid"],
+            agents_cloud=agents["cloud"],
         )
 
     def test_first_poll_records_a_silent_baseline(self):
         plugin = make_plugin()
         plugin._subs = {"s": ["*"]}
-        data = self._payload_with({"free": "down", "paid": "down", "cloud": "ok"})
+        data = self._payload_with({"free": "down", "paid": "degraded", "cloud": "ok"})
         run(plugin._check_changes(data))
         self.assertEqual(
             plugin._states,
             {
-                "claude-opus-5-5@free": "down",
-                "claude-opus-5-5@paid": "down",
-                "claude-opus-5-5@cloud": "ok",
+                "opus-5-5@free": "down",
+                "opus-5-5@paid": "degraded",
+                "opus-5-5@cloud": "ok",
             },
         )
         plugin.put_kv_data.assert_awaited_once_with("states", plugin._states)
@@ -290,14 +492,13 @@ class ChangeDetectionTest(unittest.TestCase):
         plugin = make_plugin()
         plugin._subs = {"s": ["*"]}
         plugin._states = {
-            "claude-opus-5-5@free": "ok",
-            "claude-opus-5-5@paid": "ok",
-            "claude-opus-5-5@cloud": "ok",
+            "opus-5-5@free": "ok",
+            "opus-5-5@paid": "ok",
+            "opus-5-5@cloud": "ok",
         }
         prev = self._payload_with({"free": "ok", "paid": "ok", "cloud": "ok"})
         cur = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
         run(plugin._check_changes(cur, prev))
-        # prev was ok so the change hasn't been seen twice in a row.
         plugin.context.send_message.assert_not_awaited()
 
     def test_confirmed_failure_pushes_per_cohort(self):
@@ -305,29 +506,43 @@ class ChangeDetectionTest(unittest.TestCase):
         plugin = make_plugin()
         plugin._subs = {"s": ["*"]}
         plugin._states = {
-            "claude-opus-5-5@free": "ok",
-            "claude-opus-5-5@paid": "ok",
-            "claude-opus-5-5@cloud": "ok",
+            "opus-5-5@free": "ok",
+            "opus-5-5@paid": "ok",
+            "opus-5-5@cloud": "ok",
         }
         prev = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
         cur = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
         run(plugin._check_changes(cur, prev))
         sent = sent_messages(plugin)
-        self.assertIn("🔴 claude-opus-5-5（体验）异常", sent["s"])
-        self.assertNotIn("claude-opus-5-5（订阅）异常", sent["s"])
-        self.assertEqual(plugin._states["claude-opus-5-5@free"], "down")
+        self.assertIn("🔴 opus 5.5（免费）异常", sent["s"])
+        self.assertNotIn("（订阅）异常", sent["s"])
+        self.assertEqual(plugin._states["opus-5-5@free"], "down")
+
+    def test_degraded_is_its_own_push_wording(self):
+        plugin = make_plugin()
+        plugin._subs = {"s": ["*"]}
+        plugin._states = {
+            "opus-5-5@free": "ok",
+            "opus-5-5@paid": "ok",
+            "opus-5-5@cloud": "ok",
+        }
+        prev = self._payload_with({"free": "degraded", "paid": "ok", "cloud": "ok"})
+        cur = self._payload_with({"free": "degraded", "paid": "ok", "cloud": "ok"})
+        run(plugin._check_changes(cur, prev))
+        sent = sent_messages(plugin)
+        self.assertIn("🟡 opus 5.5（免费）降级（可用率 97.5%）", sent["s"])
 
     def test_only_subscribed_cohort_gets_the_push(self):
         plugin = make_plugin()
         plugin._subs = {
-            "s-paid": ["claude-opus-5-5@paid"],
-            "s-free": ["claude-opus-5-5@free"],
-            "s-all-cohorts": ["claude-opus-5-5"],
+            "s-paid": ["opus-5-5@paid"],
+            "s-free": ["opus-5-5@free"],
+            "s-all-cohorts": ["opus-5-5"],
         }
         plugin._states = {
-            "claude-opus-5-5@free": "ok",
-            "claude-opus-5-5@paid": "ok",
-            "claude-opus-5-5@cloud": "ok",
+            "opus-5-5@free": "ok",
+            "opus-5-5@paid": "ok",
+            "opus-5-5@cloud": "ok",
         }
         prev = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
         cur = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
@@ -341,26 +556,21 @@ class ChangeDetectionTest(unittest.TestCase):
         plugin = make_plugin(confirm_samples=1)
         plugin._subs = {"s": ["*"]}
         plugin._states = {
-            "claude-opus-5-5@free": "ok",
-            "claude-opus-5-5@paid": "ok",
-            "claude-opus-5-5@cloud": "ok",
+            "opus-5-5@free": "ok",
+            "opus-5-5@paid": "ok",
+            "opus-5-5@cloud": "ok",
         }
         cur = self._payload_with({"free": "down", "paid": "ok", "cloud": "ok"})
         run(plugin._check_changes(cur, None))
-        sent = sent_messages(plugin)
-        self.assertIn("🔴 claude-opus-5-5（体验）异常", sent["s"])
+        self.assertIn("🔴 opus 5.5（免费）异常", sent_messages(plugin)["s"])
 
     def test_recovery_lists_outage_duration(self):
-        """The ok push reports how long down was visible inside the 24h cells."""
+        """The ok push reports how long the failure run lasted."""
         plugin = make_plugin()
         plugin._subs = {"s": ["*"]}
-        plugin._states = {
-            "claude-opus-5-5@free": "down",
-        }
+        plugin._states = {"opus-5-5@free": "down"}
         # 41 ok cells, then 6 down cells (3 hours), then 1 ok cell.
-        cells_with_outage = [1000] * 41 + [0] * 6 + [1000]
-        # prev already shows the recovery (status ok), so two polls of "ok"
-        # back-to-back confirm the transition.
+        cells = [1000] * 41 + [400] * 6 + [1000]
         prev = make_payload(
             agents_free=[
                 make_agent(
@@ -368,18 +578,15 @@ class ChangeDetectionTest(unittest.TestCase):
                     "Claude",
                     [
                         make_model(
-                            "claude-opus-5-5",
                             "opus 5.5",
                             status="ok",
                             availability=100.0,
                             p50=4.2,
-                            cells=cells_with_outage,
+                            cells=cells,
                         )
                     ],
                 )
-            ],
-            agents_paid=[],
-            agents_cloud=[],
+            ]
         )
         cur = make_payload(
             agents_free=[
@@ -388,25 +595,34 @@ class ChangeDetectionTest(unittest.TestCase):
                     "Claude",
                     [
                         make_model(
-                            "claude-opus-5-5",
                             "opus 5.5",
                             status="ok",
                             availability=100.0,
                             p50=4.2,
-                            cells=cells_with_outage,
+                            cells=cells,
                         )
                     ],
                 )
-            ],
-            agents_paid=[],
-            agents_cloud=[],
+            ]
         )
         run(plugin._check_changes(cur, prev))
-        sent = sent_messages(plugin)
-        self.assertIn("🟢 claude-opus-5-5（体验）已恢复", sent["s"])
-        self.assertIn("p50 4.2s", sent["s"])
-        # Cells show a 6-cell outage (3 hours).
-        self.assertIn("异常持续约 3小时", sent["s"])
+        sent = sent_messages(plugin)["s"]
+        self.assertIn("🟢 opus 5.5（免费）已恢复", sent)
+        self.assertIn("p50 4.2s", sent)
+        self.assertIn("异常持续约 3小时", sent)
+
+    def test_restart_restores_baseline_without_pushing(self):
+        """States loaded from KV act as the baseline, so no stale flood."""
+        plugin = make_plugin()
+        plugin._subs = {"s": ["*"]}
+        plugin._states = {
+            "opus-5-5@free": "down",
+            "opus-5-5@paid": "down",
+            "opus-5-5@cloud": "down",
+        }
+        data = self._payload_with({"free": "down", "paid": "down", "cloud": "down"})
+        run(plugin._check_changes(data, data))
+        plugin.context.send_message.assert_not_awaited()
 
 
 class CommandTest(unittest.TestCase):
@@ -417,14 +633,8 @@ class CommandTest(unittest.TestCase):
                     "claude-code",
                     "Claude",
                     [
-                        make_model(
-                            "claude-opus-5-5",
-                            "opus 5.5",
-                            status="down",
-                            availability=0.0,
-                            p50=None,
-                        ),
-                        make_model("claude-fable-5-1", "fable 5.1"),
+                        make_model("opus 5.5", status="down", availability=40.0, p50=None),
+                        make_model("fable 5.1", model_id="m2"),
                     ],
                     reasons=[
                         {"class": "throttle", "share": 78.5},
@@ -432,173 +642,142 @@ class CommandTest(unittest.TestCase):
                     ],
                 ),
                 make_agent(
-                    "kimi-code",
-                    "Kimi",
-                    [make_model("kimi-k3", "k3")],
+                    "codex",
+                    "GPT",
+                    [make_model("gpt-6-astra", status="degraded", availability=98.4)],
                 ),
+                make_agent("kimi-code", "Kimi", [make_model("k3", model_id="m1")]),
             ],
             agents_paid=[
                 make_agent(
                     "claude-code",
                     "Claude",
                     [
-                        make_model(
-                            "claude-opus-5-5",
-                            "opus 5.5",
-                            status="down",
-                            availability=0.0,
-                            p50=None,
-                        ),
-                        make_model("claude-fable-5-1", "fable 5.1"),
+                        make_model("opus 5.5", status="down", availability=40.0, p50=None),
+                        make_model("fable 5.1", model_id="m2"),
                     ],
                 ),
-                make_agent(
-                    "kimi-code",
-                    "Kimi",
-                    [make_model("kimi-k3", "k3")],
-                ),
+                make_agent("kimi-code", "Kimi", [make_model("k3", model_id="m1")]),
             ],
             agents_cloud=[
                 make_agent(
                     "claude-code",
                     "Claude",
                     [
-                        make_model("claude-opus-5-5", "opus 5.5"),
-                        make_model("claude-fable-5-1", "fable 5.1"),
+                        make_model("opus 5.5"),
+                        make_model("fable 5.1", model_id="m2"),
                     ],
                 ),
-                make_agent(
-                    "kimi-code",
-                    "Kimi",
-                    [make_model("kimi-k3", "k3")],
-                ),
+                make_agent("kimi-code", "Kimi", [make_model("k3", model_id="m1")]),
             ],
         )
         self.plugin = make_plugin()
         self.plugin._fetch_status = AsyncMock(return_value=self.data)
 
-    def test_overview_lists_models_with_per_cohort_lines(self):
+    def test_overview_groups_by_vendor_with_pool_segments(self):
         text = run(command(self.plugin))
         lines = text.splitlines()
-        self.assertTrue(lines[0].startswith("Mirasim 模型状态 · 可用 "))
-        # claude-opus-5-5 is down in 2 pools and ok in 1; the others are ok.
-        self.assertIn("/9", lines[0])
-        self.assertIn("7/9", lines[0])
-        self.assertIn("· claude-opus-5-5 — Claude", text)
-        self.assertIn("❌ 体验 · 0% · p50 —", text)
-        self.assertIn("❌ 订阅 · 0% · p50 —", text)
-        self.assertIn("✅ 云端 · 100% · p50 5.0s", text)
-        self.assertIn("· kimi-k3 — Kimi", text)
+        self.assertTrue(lines[0].startswith("Mirasim 模型状态 · 正常 "))
+        # 10 rows: opus/fable/k3 in 3 pools each, gpt in free only; 7 are ok
+        # (opus is down in free+paid and ok in cloud, gpt is degraded).
+        self.assertIn("正常 7/10", lines[0])
+        self.assertIn("Claude · 4/6 正常", text)
+        self.assertIn("· opus 5.5 — ❌免费 40% · ❌订阅 40% · ✅云端 100%", text)
+        self.assertIn("· gpt-6-astra — ⚠️免费 98.4%", text)
 
-    def test_problems_sort_first(self):
+    def test_problems_sort_vendors_first(self):
         text = run(command(self.plugin))
-        # claude-opus-5-5 has the worst (down) status and leads the list.
-        first_model_idx = text.index("· claude-opus-5-5")
-        self.assertLess(first_model_idx, text.index("· kimi-k3"))
-        self.assertLess(first_model_idx, text.index("· claude-fable-5-1"))
+        # Claude has a down row and leads; Kimi is entirely ok and comes last.
+        self.assertLess(text.index("Claude ·"), text.index("Kimi ·"))
 
     def test_configured_models_narrow_the_overview(self):
-        self.plugin.config["display_models"] = ["claude-opus-5-5", "gpt-9"]
+        self.plugin.config["display_models"] = ["opus 5.5", "gpt-9"]
         text = run(command(self.plugin))
-        self.assertIn("claude-opus-5-5", text)
-        self.assertNotIn("kimi-k3", text)
+        self.assertIn("opus 5.5", text)
+        self.assertNotIn("k3", text)
         self.assertIn("未找到：gpt-9", text)
         self.assertIn("/mirasim all", text)
 
     def test_configured_model_with_cohort_suffix_shows_only_that_cohort(self):
-        self.plugin.config["display_models"] = ["claude-opus-5-5@paid", "kimi-k3"]
+        self.plugin.config["display_models"] = ["opus 5.5@paid", "k3"]
         text = run(command(self.plugin))
-        lines = text.splitlines()
-        # claude-opus-5-5 narrowed to paid only.
-        opus_idx = next(
-            i for i, line in enumerate(lines) if line.startswith("· claude-opus-5-5")
+        opus_line = next(
+            line for line in text.splitlines() if line.startswith("· opus 5.5")
         )
-        kimi_idx = next(
-            i for i, line in enumerate(lines) if line.startswith("· kimi-k3")
-        )
-        opus_section = lines[opus_idx + 1 : kimi_idx]
-        opus_cohort_lines = [
-            line
-            for line in opus_section
-            if line.startswith(("  ✅", "  ⚠️", "  ❌", "  ❔"))
-        ]
-        self.assertEqual(len(opus_cohort_lines), 1)
-        self.assertIn("❌ 订阅 · 0% · p50 —", opus_cohort_lines[0])
-        # kimi-k3 keeps all three cohorts; the section ends at the trailing footer.
-        kimi_section = "\n".join(lines[kimi_idx:])
-        # Header lines should appear 1×; per-cohort rows 3× (free, paid, cloud).
-        for label in ("体验", "订阅", "云端"):
-            cohort_row = next(
-                line for line in lines[kimi_idx:] if f"  ✅ {label} ·" in line
-            )
-            self.assertIn("100%", cohort_row)
-        self.assertEqual(kimi_section.count("  ✅"), 3)
+        # One pool shown, so the line holds a single segment separator.
+        self.assertEqual(opus_line.count("·"), 1)
+        self.assertIn("❌订阅 40%", opus_line)
+        self.assertNotIn("免费", opus_line)
+        self.assertNotIn("云端", opus_line)
+        kimi_line = next(line for line in text.splitlines() if line.startswith("· k3"))
+        self.assertEqual(kimi_line.count("·"), 3)
 
     def test_configured_unknown_cohort_goes_to_missing(self):
-        self.plugin.config["display_models"] = ["kimi-k3@bogus", "kimi-k3@paid"]
+        self.plugin.config["display_models"] = ["k3@bogus", "k3@paid"]
         text = run(command(self.plugin))
-        self.assertIn("未找到：kimi-k3@bogus", text)
-        # The valid entry narrows kimi-k3 to paid only.
-        self.assertIn("  ✅ 订阅 ·", text)
-        self.assertNotIn("  ✅ 体验 ·", text)
-        self.assertNotIn("  ✅ 云端 ·", text)
+        self.assertIn("未找到：k3@bogus", text)
+        self.assertIn("· k3 — ✅订阅 100%", text)
 
     def test_configured_bare_model_broadens_after_cohort_suffix(self):
-        # Listing both forms for the same model: bare wins (shows all cohorts).
-        self.plugin.config["display_models"] = ["kimi-k3@paid", "kimi-k3"]
+        self.plugin.config["display_models"] = ["k3@paid", "k3"]
         text = run(command(self.plugin))
-        self.assertIn("  ✅ 体验 ·", text)
-        self.assertIn("  ✅ 订阅 ·", text)
-        self.assertIn("  ✅ 云端 ·", text)
+        self.assertIn("· k3 — ✅免费 100% · ✅订阅 100% · ✅云端 100%", text)
 
     def test_configured_multiple_cohorts_stack(self):
-        self.plugin.config["display_models"] = ["kimi-k3@paid", "kimi-k3@free"]
+        self.plugin.config["display_models"] = ["k3@paid", "k3@free"]
         text = run(command(self.plugin))
-        self.assertIn("  ✅ 体验 ·", text)
-        self.assertIn("  ✅ 订阅 ·", text)
-        self.assertNotIn("  ✅ 云端 ·", text)
+        self.assertIn("· k3 — ✅免费 100% · ✅订阅 100%", text)
+        self.assertNotIn("云端", text)
 
     def test_display_models_order_is_respected(self):
-        # Even with kimi-k3 ok and claude-opus-5-5 down, kimi-k3 stays first
-        # because that's the order in display_models.
-        self.plugin.config["display_models"] = [
-            "kimi-k3",
-            "claude-opus-5-5",
-            "claude-fable-5-1",
-        ]
+        self.plugin.config["display_models"] = ["k3", "opus 5.5", "fable 5.1"]
         text = run(command(self.plugin))
-        self.assertLess(text.index("· kimi-k3"), text.index("· claude-opus-5-5"))
-        self.assertLess(text.index("· claude-opus-5-5"), text.index("· claude-fable-5-1"))
-
-    def test_no_display_models_falls_back_to_status_first(self):
-        # display_models=[] (falsy) means "no filter": same default ordering.
-        self.plugin.config["display_models"] = []
-        text = run(command(self.plugin))
-        first_model_idx = text.index("· claude-opus-5-5")
-        self.assertLess(first_model_idx, text.index("· kimi-k3"))
+        self.assertLess(text.index("· k3"), text.index("· opus 5.5"))
+        self.assertLess(text.index("· opus 5.5"), text.index("· fable 5.1"))
 
     def test_detail_view_default_shows_all_cohorts(self):
-        text = run(command(self.plugin, "claude-opus-5-5"))
-        self.assertTrue(text.startswith("· claude-opus-5-5"))
-        self.assertIn("❌ 体验池 异常（可用率 0%）", text)
-        self.assertIn("❌ 订阅池 异常（可用率 0%）", text)
+        text = run(command(self.plugin, "opus 5.5"))
+        self.assertTrue(text.startswith("· opus 5.5（Claude）"))
+        self.assertIn("❌ 免费池 异常", text)
+        self.assertIn("❌ 订阅池 异常", text)
         self.assertIn("✅ 云端池 正常", text)
 
     def test_detail_view_with_cohort_filter(self):
-        text = run(command(self.plugin, "claude-opus-5-5@paid"))
-        self.assertTrue(text.startswith("· claude-opus-5-5@paid"))
+        text = run(command(self.plugin, "opus 5.5@paid"))
+        self.assertTrue(text.startswith("· opus 5.5@paid"))
         self.assertIn("❌ 订阅池 异常", text)
-        self.assertNotIn("体验池", text)
+        self.assertNotIn("免费池", text)
         self.assertNotIn("云端池", text)
 
+    def test_detail_view_accepts_chinese_cohort(self):
+        text = run(command(self.plugin, "opus 5.5@订阅"))
+        self.assertTrue(text.startswith("· opus 5.5@paid"))
+        self.assertIn("❌ 订阅池 异常", text)
+
     def test_detail_view_unknown_cohort(self):
-        text = run(command(self.plugin, "claude-opus-5-5@bogus"))
+        text = run(command(self.plugin, "opus 5.5@bogus"))
         self.assertIn("未知池「bogus」", text)
 
     def test_detail_view_shows_failure_reason(self):
-        text = run(command(self.plugin, "claude-opus-5-5@free"))
-        self.assertIn("限流", text)
-        self.assertIn("故障", text)
+        text = run(command(self.plugin, "opus 5.5@free"))
+        self.assertIn("限流79%·故障21%", text)
+
+    def test_model_name_with_spaces_works(self):
+        """GreedyStr keeps "opus 5.5" together instead of splitting on space."""
+        text = run(command(self.plugin, "opus", "5.5"))
+        self.assertTrue(text.startswith("· opus 5.5"))
+
+    def test_agents_view_reads_summaries(self):
+        text = run(command(self.plugin, "agents"))
+        self.assertIn("Mirasim 厂商状态", text)
+        self.assertIn("· Claude", text)
+        self.assertIn("❌ 免费", text)
+        self.assertIn("· Kimi", text)
+
+    def test_help_lists_commands(self):
+        text = run(command(self.plugin, "help"))
+        self.assertIn("/mirasim all", text)
+        self.assertIn("/mirasim agents", text)
 
     def test_fetch_failure_is_reported(self):
         self.plugin._fetch_status = AsyncMock(side_effect=TimeoutError())
@@ -608,34 +787,47 @@ class CommandTest(unittest.TestCase):
 
     def test_subscription_lifecycle(self):
         plugin = self.plugin
-        reply = run(command(plugin, "sub", "opus"))
-        self.assertIn("已订阅 claude-opus-5-5 的全部 3 个池", reply)
-        self.assertEqual(plugin._subs, {"qq:GroupMessage:1": ["claude-opus-5-5"]})
+        reply = run(command(plugin, "sub", "opus 5.5"))
+        self.assertIn("已订阅 opus 5.5 的全部 3 个池", reply)
+        self.assertEqual(plugin._subs, {"qq:GroupMessage:1": ["opus-5-5"]})
         plugin.put_kv_data.assert_awaited_with("subscriptions", plugin._subs)
 
-        reply = run(command(plugin, "sub", "claude-fable-5-1@paid"))
-        self.assertIn("claude-fable-5-1@paid", reply)
+        reply = run(command(plugin, "sub", "fable 5.1@paid"))
+        self.assertIn("fable 5.1@paid", reply)
         self.assertIn("订阅池", reply)
 
         listing = run(command(plugin, "list"))
         self.assertIn("订阅了 2 项", listing)
-        self.assertIn("· claude-fable-5-1@paid", listing)
+        self.assertIn("· fable-5-1@paid", listing)
 
         self.assertIn("还没有订阅", run(command(plugin, "list", umo="qq:Friend:9")))
 
-        reply = run(command(plugin, "unsub", "claude-opus-5-5"))
-        self.assertEqual(reply, "已取消订阅 claude-opus-5-5。")
-        reply = run(command(plugin, "unsub", "claude-fable-5-1@paid"))
-        self.assertEqual(reply, "已取消订阅 claude-fable-5-1@paid。")
+        self.assertEqual(
+            run(command(plugin, "unsub", "opus 5.5")), "已取消订阅 opus-5-5。"
+        )
+        self.assertEqual(
+            run(command(plugin, "unsub", "fable 5.1@paid")),
+            "已取消订阅 fable-5-1@paid。",
+        )
         self.assertEqual(plugin._subs, {})
+
+    def test_duplicate_subscription_is_reported(self):
+        plugin = self.plugin
+        run(command(plugin, "sub", "opus 5.5"))
+        self.assertIn("已订阅", run(command(plugin, "sub", "opus 5.5")))
+
+    def test_broad_subscription_covers_narrow_target(self):
+        plugin = self.plugin
+        run(command(plugin, "sub", "opus 5.5"))
+        self.assertIn("已覆盖", run(command(plugin, "sub", "opus 5.5@paid")))
 
     def test_subscribing_to_everything(self):
         plugin = self.plugin
-        run(command(plugin, "sub", "claude-opus-5-5"))
+        run(command(plugin, "sub", "opus 5.5"))
         self.assertIn("已订阅全部模型", run(command(plugin, "sub", "all")))
         self.assertEqual(plugin._subs, {"qq:GroupMessage:1": ["*"]})
-        self.assertIn("无需单独订阅", run(command(plugin, "sub", "kimi")))
-        self.assertIn("unsub all", run(command(plugin, "unsub", "kimi")))
+        self.assertIn("无需单独订阅", run(command(plugin, "sub", "k3")))
+        self.assertIn("unsub all", run(command(plugin, "unsub", "k3")))
         self.assertEqual(
             run(command(plugin, "unsub", "all")), "已取消本会话的全部订阅。"
         )
@@ -646,20 +838,14 @@ class ImageTest(unittest.TestCase):
     def setUp(self):
         self.data = make_payload(
             agents_free=[
-                make_agent(
-                    "claude-code",
-                    "Claude",
-                    [make_model("<b>odd</b>", "odd")],
-                ),
+                make_agent("claude-code", "Claude", [make_model("<b>odd</b>")]),
                 make_agent(
                     "kimi-code",
                     "Kimi",
-                    [make_model("kimi-k3", "k3", status="down", availability=0.0, p50=None)],
+                    [make_model("k3", status="down", availability=40.0, p50=None)],
                     reasons=[{"class": "outage", "share": 100.0}],
                 ),
-            ],
-            agents_paid=[],
-            agents_cloud=[],
+            ]
         )
         self.plugin = make_plugin(render_image=True)
         self.plugin._fetch_status = AsyncMock(return_value=self.data)
@@ -690,17 +876,17 @@ class ImageTest(unittest.TestCase):
         self.assertFalse(options["return_url"])
         self.assertEqual(options["options"]["device_scale_factor_level"], "ultra")
 
-    def test_template_renders_the_cards(self):
+    def test_template_renders_groups_and_pools(self):
         self.plugin.html_render = AsyncMock(return_value=self.fake_image(b"\xff\xd8"))
         run(command(self.plugin))
-
         for autoescape in (False, True):
             html = self.rendered_html(autoescape)
-            # The down model comes before the ok one.
-            self.assertLess(html.index("kimi-k3"), html.index("&lt;b&gt;odd&lt;/b&gt;"))
-            # One row per cohort of the model.
-            self.assertIn("体验", html)
-            # Strip fills all 48 slots; my fixtures have all-1000 cells.
+            # The down vendor comes first, and both vendors are labelled.
+            self.assertLess(html.index("Kimi"), html.index("&lt;b&gt;odd&lt;/b&gt;"))
+            self.assertIn("Claude", html)
+            # One pool row per cohort.
+            self.assertIn("免费", html)
+            # Strip fills all 48 slots; the fixtures use all-1000 cells.
             self.assertIn('class="ok" style="grid-column: 48"', html)
 
     def test_text_from_the_api_is_escaped_whatever_t2i_does(self):
@@ -715,7 +901,7 @@ class ImageTest(unittest.TestCase):
         page = self.fake_image(b"<html><title>502 Bad Gateway</title></html>")
         self.plugin.html_render = AsyncMock(return_value=page)
         reply = run(command(self.plugin))
-        self.assertTrue(reply.startswith("Mirasim 模型状态 · 可用"))
+        self.assertTrue(reply.startswith("Mirasim 模型状态 · 正常"))
 
     def test_template_skips_the_shiki_injection(self):
         # AstrBot otherwise appends a 2.4 MB highlighter to every request.

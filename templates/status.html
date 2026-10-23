@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=580, height=100">
+<meta name="viewport" content="width=620, height=100">
 <!-- The small height lets full_page screenshots shrink to the content; the
      T2I service otherwise pads short cards up to its 720px default. -->
 <!-- An element with this id stops AstrBot from injecting its 2.4 MB Shiki
@@ -14,113 +14,140 @@
   --ink: #eeeadd; --muted: #aeb3a8; --faint: #818b81;
   --ok: #8ad0be; --ok-bg: #263d35;
   --down: #f2a09a; --down-bg: #422d2b;
-  --warn: #dec38c; --warn-bg: #3c3528;
-  --nodata: #818b81;
+  --degraded: #dec38c; --degraded-bg: #3c3528;
   --mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { background: var(--bg); }
 body {
-  width: 580px; padding: 26px 22px 22px; color: var(--ink);
+  width: 620px; padding: 26px 22px 20px; color: var(--ink);
   font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC",
     "Source Han Sans SC", "WenQuanYi Micro Hei", sans-serif;
   font-size: 13px; line-height: 1.5; font-variant-numeric: tabular-nums;
 }
 .eyebrow { font: 11px/1.4 var(--mono); letter-spacing: .14em; color: var(--muted); }
 h1 { font-size: 22px; font-weight: 600; letter-spacing: .015em; margin-top: 6px; }
-.subtitle { color: var(--muted); font-size: 13px; margin-top: 4px; }
+.subtitle { color: var(--muted); font-size: 12px; margin-top: 4px; }
 .totals {
-  display: flex; gap: 22px; margin-top: 16px; padding: 12px 0;
+  display: flex; gap: 20px; margin-top: 15px; padding: 11px 0;
   border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
 }
-.totals div { display: flex; align-items: baseline; gap: 8px; }
+.totals div { display: flex; align-items: baseline; gap: 7px; }
 .totals dt { color: var(--muted); font-size: 12px; }
-.totals dd { font: 600 20px/1.3 var(--mono); }
+.totals dd { font: 600 19px/1.3 var(--mono); }
 .ok-text { color: var(--ok); }
 .down-text { color: var(--down); }
-.warn-text { color: var(--warn); }
-.group { margin-top: 18px; }
-.group-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.degraded-text { color: var(--degraded); }
+.cohorts {
+  display: flex; gap: 16px; margin-top: 10px;
+  font: 12px/1.5 var(--mono); color: var(--muted);
+}
+.cohorts b { font-weight: 600; }
+.cohorts b.ok { color: var(--ok); }
+.cohorts b.degraded { color: var(--degraded); }
+.cohorts b.down { color: var(--down); }
+.group { margin-top: 16px; }
+.group-head { display: flex; align-items: baseline; gap: 9px; margin-bottom: 7px; }
 .group-name { font: 600 14px/1.4 var(--mono); }
-.group-agent { font-size: 12px; color: var(--muted); }
-.group-worst { font-size: 12px; }
+.group-count { font: 11px/1.4 var(--mono); color: var(--muted); }
+.group-worst { font-size: 11px; }
 .group-worst.ok { color: var(--ok); }
-.group-worst.warn { color: var(--warn); }
+.group-worst.degraded { color: var(--degraded); }
 .group-worst.down { color: var(--down); }
-.list {
-  background: var(--surface);
-  border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
-}
-.row { padding: 10px 14px 11px; border-top: 1px solid var(--line); }
-.row:first-child { border-top: 0; }
-.line { display: flex; align-items: center; gap: 10px; }
-.line + .line { margin-top: 6px; }
-.cohort {
-  flex: 0 0 36px; font: 600 12px/1.45 var(--mono); color: var(--muted);
-  text-transform: uppercase; letter-spacing: .08em;
-}
-.metrics { font: 13px/1.45 var(--mono); color: var(--muted); white-space: nowrap; }
+.list { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.model { padding: 9px 13px 10px; border-top: 1px solid var(--line); }
+.model:first-child { border-top: 0; }
+.model-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 5px; }
+.model-name { font: 600 13px/1.4 var(--mono); }
+.model-worst { font-size: 11px; }
+.model-worst.ok { color: var(--ok); }
+.model-worst.degraded { color: var(--degraded); }
+.model-worst.down { color: var(--down); }
+.pools { display: flex; flex-direction: column; gap: 3px; }
+.pool { display: flex; align-items: center; gap: 9px; }
+.cohort { flex: 0 0 34px; font: 600 11px/1.45 var(--mono); color: var(--muted); }
+.pool.empty .metrics { color: var(--faint); font-style: italic; }
+.metrics { flex: 0 0 auto; font: 12px/1.45 var(--mono); color: var(--muted); white-space: nowrap; }
 .badge {
-  display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
-  padding: 2px 7px; border-radius: 3px; font-size: 12px; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0;
+  padding: 1px 6px; border-radius: 3px; font-size: 11px; white-space: nowrap;
 }
 .badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 .badge.ok { background: var(--ok-bg); color: var(--ok); }
 .badge.down { background: var(--down-bg); color: var(--down); }
-.badge.warn { background: var(--warn-bg); color: var(--warn); }
-.badge.nodata, .badge.unknown { background: transparent; color: var(--nodata); border: 1px dashed var(--line); }
-.note { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); }
+.badge.degraded { background: var(--degraded-bg); color: var(--degraded); }
+.badge.nodata, .badge.unknown { background: transparent; color: var(--faint); border: 1px dashed var(--line); }
+.note { flex: 1; min-width: 0; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .note.down { color: var(--down); }
-.note.warn { color: var(--warn); }
-.note.nodata, .note.unknown { color: var(--nodata); }
+.note.degraded { color: var(--degraded); }
+.note.nodata, .note.unknown { color: var(--faint); }
 .history {
-  flex: 0 0 200px; display: grid; grid-template-columns: repeat(48, minmax(0, 1fr));
-  gap: 1px; height: 12px; align-items: end;
+  flex: 0 0 168px; display: grid; grid-template-columns: repeat(48, minmax(0, 1fr));
+  gap: 1px; height: 11px; align-items: end;
 }
-.history i { display: block; height: 12px; background: var(--ok); border-radius: 1px; }
-.history i.warn { background: var(--warn); }
+.history i { display: block; height: 11px; background: var(--ok); border-radius: 1px; }
+.history i.degraded { background: var(--degraded); }
 .history i.down { background: var(--down); }
 .history i.unknown { background: var(--faint); opacity: .35; }
-.empty { color: var(--muted); text-align: center; padding: 28px 14px; }
+.empty { color: var(--muted); text-align: center; padding: 26px 14px; }
+.notes { margin-top: 12px; color: var(--degraded); font-size: 12px; }
+.notes li { margin-top: 3px; list-style: none; }
 .footer {
   display: flex; justify-content: space-between; gap: 12px;
-  margin-top: 14px; color: var(--faint); font-size: 12px;
+  margin-top: 14px; color: var(--faint); font-size: 11px;
 }
-.missing { margin-top: 6px; color: var(--warn); font-size: 12px; }
+.missing { margin-top: 6px; color: var(--degraded); font-size: 12px; }
 </style>
 </head>
 <body>
   <p class="eyebrow">MIRASIM / AVAILABILITY MONITOR</p>
   <h1>Mirasim 模型状态</h1>
-  <p class="subtitle">检测于 {{ checked_at | e }}{% if interval %} · 每 {{ interval | e }}一格{% endif %} · 数据源 mirasim.ai</p>
+  <p class="subtitle">检测于 {{ checked_at | e }}{% if through_at and through_at != checked_at %} · 数据截至 {{ through_at | e }}{% endif %}{% if interval %} · 每 {{ interval | e }}一格{% endif %} · 数据源 {{ source | e }}</p>
   <dl class="totals">
     <div><dt>正常</dt><dd class="ok-text">{{ counts.get("ok", 0) }}</dd></div>
-    <div><dt>不稳定</dt><dd class="warn-text">{{ counts.get("warn", 0) }}</dd></div>
+    <div><dt>降级</dt><dd class="degraded-text">{{ counts.get("degraded", 0) }}</dd></div>
     <div><dt>异常</dt><dd class="down-text">{{ counts.get("down", 0) }}</dd></div>
-    <div><dt>无数据</dt><dd>{{ counts.get("nodata", 0) }}</dd></div>
+    <div><dt>无数据</dt><dd>{{ counts.get("nodata", 0) + counts.get("unknown", 0) }}</dd></div>
     <div><dt>合计</dt><dd>{{ total_rows }}</dd></div>
   </dl>
+  {% if cohort_states %}
+  <div class="cohorts">
+    {% for cid, state in cohort_states.items() %}
+    <span>{{ cohort_names.get(cid, cid) | e }} <b class="{{ state }}">{{ status_names.get(state, state) | e }}</b></span>
+    {% endfor %}
+  </div>
+  {% endif %}
   {% for group in groups %}
   <div class="group">
     <div class="group-head">
-      <span class="group-name">{{ group.id | e }}</span>
-      {% if group.agent %}<span class="group-agent">{{ group.agent | e }}</span>{% endif %}
+      <span class="group-name">{{ group.agent | e }}</span>
+      <span class="group-count">{{ group.up }}/{{ group.total }}</span>
       <span class="group-worst {{ group.worst }}">●</span>
     </div>
     <div class="list">
-      {% for card in group.cards %}
-      <div class="row">
-        <div class="line">
-          <span class="cohort">{{ card.cohort_label | e }}</span>
-          <span class="metrics">{{ card.metrics | e }}</span>
-          <span class="badge {{ card.status }}">{{ card.label | e }}</span>
+      {% for model in group.models %}
+      <div class="model">
+        <div class="model-head">
+          <span class="model-name">{{ model.name | e }}</span>
+          <span class="model-worst {{ model.worst }}">●</span>
         </div>
-        <div class="line">
-          <span class="note {{ card.status }}">{{ card.note | e }}</span>
-          <span class="history">
-            {%- set offset = 48 - card.history | length -%}
-            {% for state in card.history %}<i class="{{ state }}" style="grid-column: {{ offset + loop.index0 + 1 }}"></i>{% endfor %}
-          </span>
+        <div class="pools">
+          {% for cell in model.cells %}
+          <div class="pool{% if cell.empty %} empty{% endif %}">
+            <span class="cohort">{{ cohort_names.get(cell.cohort, cell.cohort) | e }}</span>
+            {% if cell.empty %}
+            <span class="metrics">—</span>
+            {% else %}
+            <span class="metrics">{{ cell.metrics | e }}</span>
+            <span class="badge {{ cell.status }}">{{ cell.label | e }}</span>
+            <span class="note {{ cell.status }}">{{ cell.note | e }}</span>
+            <span class="history">
+              {%- set offset = 48 - cell.history | length -%}
+              {% for state in cell.history %}<i class="{{ state }}" style="grid-column: {{ offset + loop.index0 + 1 }}"></i>{% endfor %}
+            </span>
+            {% endif %}
+          </div>
+          {% endfor %}
         </div>
       </div>
       {% endfor %}
@@ -129,6 +156,7 @@ h1 { font-size: 22px; font-weight: 600; letter-spacing: .015em; margin-top: 6px;
   {% else %}
   <div class="list" style="margin-top:14px;"><div class="empty">暂无模型数据</div></div>
   {% endfor %}
+  {% if notes %}<ul class="notes">{% for note in notes %}<li>注：{{ note | e }}</li>{% endfor %}</ul>{% endif %}
   <div class="footer">
     <span>{% if filtered %}仅展示配置的模型 · /mirasim all 查看全部{% else %}右侧为最近 24 小时 48 格，旧 → 新{% endif %}</span>
     <span>{{ source | e }}</span>
