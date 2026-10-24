@@ -23,6 +23,8 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
 
+from . import pricing
+
 try:  # AstrBot's own commands annotate trailing params with this marker class.
     from astrbot.core.star.filter.command import GreedyStr
 except Exception:  # pragma: no cover - very old AstrBot without the marker
@@ -120,6 +122,7 @@ USAGE = (
     "/mirasim <模型> — 查看单个模型各池详情\n"
     "/mirasim <模型>@<free|paid|cloud> — 只看指定池\n"
     "/mirasim agents — 按厂商查看整体状态\n"
+    "/mirasim price — 查看模型价目表\n"
     "/mirasim sub <模型>[@池]|all — 本会话订阅状态变化推送\n"
     "/mirasim unsub <模型>[@池]|all — 取消订阅\n"
     "/mirasim list — 查看本会话的订阅\n"
@@ -225,6 +228,48 @@ def _fmt_rate(value: object, *, short: bool = False) -> str:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return "—"
     return f"{round(value, 1):g}%" if short else f"{value:.1f}%"
+
+
+def _fmt_price(value: object) -> str:
+    """Format a price in credits per million tokens.
+
+    Args:
+        value: The price as a number.
+
+    Returns:
+        The price without a trailing ``.0``, or an empty string when the
+        price page has none.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return ""
+    return f"{value:g}"
+
+
+def _price_bits(price: pricing.Price) -> str:
+    """Render one model's three prices.
+
+    Args:
+        price: The price entry.
+
+    Returns:
+        The input, output and cache read prices in one line.
+    """
+    parts = []
+    for label, (list_price, current) in (
+        ("输入", price.input_price),
+        ("输出", price.output_price),
+        ("缓存读取", price.cache_read_price),
+    ):
+        charged = _fmt_price(current)
+        if not charged:
+            parts.append(f"{label} —")
+            continue
+        struck = _fmt_price(list_price)
+        if struck and struck != charged:
+            parts.append(f"{label} {charged}（刊例 {struck}）")
+        else:
+            parts.append(f"{label} {charged}")
+    return " · ".join(parts)
 
 
 WINDOW_UNITS = {"m": "分钟", "h": "小时", "d": "天"}
@@ -779,6 +824,8 @@ class MirasimStatus(Star):
         self._task: asyncio.Task | None = None
         # (monotonic timestamp, payload) reused for CACHE_TTL seconds.
         self._cache: tuple[float, dict] | None = None
+        # (monotonic timestamp, price list) reused for the price cache window.
+        self._price_cache: tuple[float, pricing.PriceList] | None = None
 
     async def initialize(self) -> None:
         """Restore persisted state and start the background poller."""
@@ -821,6 +868,37 @@ class MirasimStatus(Star):
             raise ValueError("unexpected status payload")
         self._cache = (now, data)
         return data
+
+    async def _fetch_prices(self) -> pricing.PriceList:
+        """Fetch the price list the site publishes.
+
+        The prices live on a rendered page rather than in the status payload,
+        and they change rarely, so the list is cached for hours. A failure
+        keeps the last list that was read, so a temporary outage costs nothing
+        but a stale price.
+
+        Returns:
+            The price list, empty when it was never read.
+        """
+        now = time.monotonic()
+        if self._price_cache is not None:
+            cached_at, cached = self._price_cache
+            if now - cached_at < pricing.PRICE_CACHE_TTL:
+                return cached
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                resp = await client.get(
+                    pricing.PRICE_URL, headers={"Accept": "text/html"}
+                )
+                resp.raise_for_status()
+            parsed = pricing.parse_prices(resp.text)
+        except Exception as exc:
+            logger.warning(f"[Mirasim] Price list query failed: {exc!r}")
+            if self._price_cache is not None:
+                return self._price_cache[1]
+            return pricing.PriceList(entries={}, updated="")
+        self._price_cache = (now, parsed)
+        return parsed
 
     async def _poll_loop(self) -> None:
         """Poll the monitor forever and push confirmed status changes."""
@@ -979,6 +1057,8 @@ class MirasimStatus(Star):
             text = self._render_subscriptions(umo)
         elif act in ("agents", "厂商", "厂商状态"):
             text = await self._render_agents_view()
+        elif act in ("price", "prices", "价格", "价目表"):
+            text = self._render_price_list(await self._fetch_prices())
         else:
             try:
                 data = await self._fetch_status()
@@ -987,7 +1067,7 @@ class MirasimStatus(Star):
                 text = f"获取 Mirasim 状态失败：{str(exc) or type(exc).__name__}"
             else:
                 if query and query.lower() not in ALL_WORDS:
-                    text = self._render_model(data, query)
+                    text = self._render_model(data, query, await self._fetch_prices())
                 else:
                     show_all = bool(query)
                     if self.config.get("render_image", True):
@@ -1302,12 +1382,13 @@ class MirasimStatus(Star):
             return None
         return path
 
-    def _render_model(self, data: dict, query: str) -> str:
+    def _render_model(self, data: dict, query: str, prices: pricing.PriceList) -> str:
         """Render the detail view of one model, or one of its cohorts.
 
         Args:
             data: Status payload.
             query: The user's ``model[@cohort]`` input.
+            prices: The price list to look the model up in.
 
         Returns:
             The reply text.
@@ -1393,6 +1474,44 @@ class MirasimStatus(Star):
                     f"  近 24h（旧→新，每格 {_cell_width(data)}）：\n  {stripe}"
                 )
         _append_footer(lines, data, cohorts={c for c, _m, _a in record["entries"]})
+        price = prices.find(record["agent"], record["name"])
+        if price is not None:
+            lines.append("")
+            lines.append("💲 价格（每百万 token 扣的额度，$1 = 1 额度）")
+            lines.append(f"· {_price_bits(price)}")
+            if price.discounted:
+                lines.append(
+                    f"· ⏳{price.badge or price.tag}，优惠随时可能结束，结束后按刊例价扣"
+                )
+        return "\n".join(lines)
+
+    def _render_price_list(self, prices: pricing.PriceList) -> str:
+        """Render the whole price list, grouped by vendor.
+
+        Args:
+            prices: The price list.
+
+        Returns:
+            The reply text.
+        """
+        if not prices.entries:
+            return "暂时取不到 Mirasim 的价目表，稍后再试。"
+        lines = [
+            "Mirasim 模型价目表",
+            "每百万 token 扣的额度，$1 = 1 额度",
+            "",
+        ]
+        vendor = None
+        for entry in prices.entries.values():
+            if entry.vendor != vendor:
+                vendor = entry.vendor
+                badge = f" ⏳{entry.badge}" if entry.badge else ""
+                lines.append(f"{vendor}{badge}")
+            lines.append(f"· {entry.name} — {_price_bits(entry)}")
+        lines.append("")
+        lines.append("· 缓存写入也按官方 API 价扣；用自己的账号或 API 密钥不扣额度")
+        if prices.updated:
+            lines.append(f"· 更新于 {prices.updated}")
         return "\n".join(lines)
 
     def _resolve_model_and_entry(

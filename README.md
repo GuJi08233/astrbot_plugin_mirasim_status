@@ -16,6 +16,8 @@
 | `/mirasim all` | 查看全部模型，忽略上面的配置 |
 | `/mirasim <模型>` | 查看单个模型在 free/paid/cloud 三池的详情：当前状态、p50/p95、24h/7d 可用率、最近 24h 历史 |
 | `/mirasim <模型>@<free\|paid\|cloud>` | 只看该模型在指定池的详情 |
+| `/mirasim agents` | 按厂商查看整体状态 |
+| `/mirasim price` | 查看模型价目表（每百万 token 扣多少额度） |
 | `/mirasim sub <模型>` | 订阅该模型全部池的状态变化推送 |
 | `/mirasim sub <模型>@<池>` | 只订阅指定池 |
 | `/mirasim sub all` | 本会话订阅全部模型，包括之后新增的模型 |
@@ -24,6 +26,12 @@
 | `/mirasim help` | 显示指令说明 |
 
 模型名可以只写能唯一确定的一部分，例如 `opus-5-5` 即 `opus 5.5`（`Gemini 4 Argon` 写成 `gemini` 也能唯一命中）；匹配到多个模型时会列出候选。池子可以用英文 ID 或中文别名（免费/订阅/云端，`免费` 也接受 `体验`）。子命令也可以用中文：`订阅`、`取消订阅`（`退订`）、`订阅列表`、`全部`。
+
+## 价格
+
+单个模型的详情底部会附上它的价格，`/mirasim price` 列出整张价目表。价格来自 [模型价格页](https://mirasim.ai/zh/models)，单位是每百万 token 扣的额度（`$1 = 1 额度`），分输入 / 输出 / 缓存读取三项。
+
+标了「限时」的模型会同时给出刊例价和优惠价，例如 `输入 0.01（刊例 0.1）`；优惠是临时的，结束后按刊例价扣。价格表缓存数小时，官方改价后会自动更新。
 
 ## 状态分级
 
@@ -86,5 +94,7 @@ Mirasim 状态变化
 在 AstrBot 根目录运行。`ASTRBOT_ROOT` 指向临时目录，避免导入 AstrBot 时改动真实的 `data/`：
 
 ```bash
-ASTRBOT_ROOT=/tmp/mirasim_test uv run python -m unittest data.plugins.astrbot_plugin_mirasim_status.tests.test_main
+ASTRBOT_ROOT=/tmp/mirasim_test uv run python -m unittest \
+    data.plugins.astrbot_plugin_mirasim_status.tests.test_main \
+    data.plugins.astrbot_plugin_mirasim_status.tests.test_pricing
 ```
