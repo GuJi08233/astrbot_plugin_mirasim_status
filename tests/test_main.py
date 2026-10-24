@@ -22,6 +22,8 @@ import jinja2
 
 from astrbot.core.utils.t2i.network_strategy import inject_shiki_runtime
 
+from data.plugins.astrbot_plugin_mirasim_status import pricing
+
 main_mod = importlib.import_module("data.plugins.astrbot_plugin_mirasim_status.main")
 MirasimStatus = main_mod.MirasimStatus
 
@@ -139,6 +141,32 @@ def sent_messages(plugin: MirasimStatus) -> dict[str, str]:
         umo, chain = call.args
         result[umo] = chain.chain[0].text
     return result
+
+
+# Two models of the fixture payload, one of them discounted.
+PRICE_LIST = pricing.PriceList(
+    entries={
+        "claude-opus-5-5": pricing.Price(
+            name="Claude Opus 5.5",
+            vendor="Claude",
+            badge="",
+            tag="",
+            input_price=(None, 4.0),
+            output_price=(None, 20.0),
+            cache_read_price=(None, 0.2),
+        ),
+        "gpt-6-astra": pricing.Price(
+            name="GPT-6 Astra",
+            vendor="OpenAI",
+            badge="限时 1 折",
+            tag="",
+            input_price=(10.0, 1.0),
+            output_price=(50.0, 5.0),
+            cache_read_price=(1.0, 0.1),
+        ),
+    },
+    updated="2026-10-24",
+)
 
 
 async def command(plugin: MirasimStatus, *args: str, umo: str = "qq:GroupMessage:1"):
@@ -772,19 +800,35 @@ class CommandTest(unittest.TestCase):
         opus_line = next(
             line for line in text.splitlines() if line.startswith("· opus 5.5")
         )
-        # One pool shown, so the line holds a single segment separator.
-        self.assertEqual(opus_line.count("·"), 1)
+        # One pool shown, so the line names one pool and no other.
         self.assertIn("❌订阅 40%", opus_line)
         self.assertNotIn("免费", opus_line)
         self.assertNotIn("云端", opus_line)
         kimi_line = next(line for line in text.splitlines() if line.startswith("· k3"))
-        self.assertEqual(kimi_line.count("·"), 3)
+        self.assertIn("✅免费 100%", kimi_line)
+        self.assertIn("✅订阅 100%", kimi_line)
+        self.assertIn("✅云端 100%", kimi_line)
 
     def test_configured_unknown_cohort_goes_to_missing(self):
         self.plugin.config["display_models"] = ["k3@bogus", "k3@paid"]
         text = run(command(self.plugin))
         self.assertIn("未找到：k3@bogus", text)
         self.assertIn("· k3 — ✅订阅 100%", text)
+
+    def test_overview_shows_the_prices(self):
+        self.plugin._fetch_prices = AsyncMock(return_value=PRICE_LIST)
+        text = run(command(self.plugin))
+        self.assertIn("💲 4/20/0.2", text)
+        # A discounted model says so and shows what is charged now.
+        self.assertIn("💲 1/5/0.1 ⏳1 折", text)
+        self.assertIn("💲 价格为输入/输出/缓存读取", text)
+
+    def test_overview_without_prices_shows_none(self):
+        self.plugin._fetch_prices = AsyncMock(
+            return_value=pricing.PriceList(entries={}, updated="")
+        )
+        text = run(command(self.plugin))
+        self.assertNotIn("💲", text)
 
     def test_configured_bare_model_broadens_after_cohort_suffix(self):
         self.plugin.config["display_models"] = ["k3@paid", "k3"]

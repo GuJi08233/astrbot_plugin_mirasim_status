@@ -63,6 +63,13 @@ h1 { font-size: 22px; font-weight: 600; letter-spacing: .015em; margin-top: 6px;
 .model-worst.ok { color: var(--ok); }
 .model-worst.degraded { color: var(--degraded); }
 .model-worst.down { color: var(--down); }
+.model-price {
+  display: flex; flex-wrap: wrap; gap: 2px 12px; margin: -2px 0 6px;
+  font: 11px/1.45 var(--mono); color: var(--faint);
+}
+.model-price s { opacity: .55; }
+.model-price .price-item { white-space: nowrap; }
+.model-price .price-flag { color: var(--degraded); }
 .pools { display: flex; flex-direction: column; gap: 3px; }
 .pool { display: flex; align-items: center; gap: 9px; }
 .cohort { flex: 0 0 34px; font: 600 11px/1.45 var(--mono); color: var(--muted); }
@@ -131,6 +138,14 @@ h1 { font-size: 22px; font-weight: 600; letter-spacing: .015em; margin-top: 6px;
           <span class="model-name">{{ model.name | e }}</span>
           <span class="model-worst {{ model.worst }}">●</span>
         </div>
+        {% if model.price %}
+        <div class="model-price">
+          {% for cell in model.price %}
+          <span class="price-item">{{ cell.label | e }} {% if cell.list %}<s>{{ cell.list | e }}</s> {% endif %}{{ cell.current | e }}</span>
+          {% endfor %}
+          {% if model.price_flag %}<span class="price-flag">⏳ {{ model.price_flag | e }}</span>{% endif %}
+        </div>
+        {% endif %}
         <div class="pools">
           {% for cell in model.cells %}
           <div class="pool{% if cell.empty %} empty{% endif %}">

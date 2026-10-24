@@ -245,6 +245,34 @@ def _fmt_price(value: object) -> str:
     return f"{value:g}"
 
 
+def _price_cells(price: pricing.Price | None) -> list[dict]:
+    """Split a price into its three labelled prices.
+
+    Args:
+        price: The price entry, or None when the model has no price.
+
+    Returns:
+        One dict per price with its label, the price charged and the list
+        price that is struck through while a promotion runs.
+    """
+    if price is None:
+        return []
+    cells = []
+    for label, (list_price, current) in (
+        ("输入", price.input_price),
+        ("输出", price.output_price),
+        ("缓存读取", price.cache_read_price),
+    ):
+        cells.append(
+            {
+                "label": label,
+                "current": _fmt_price(current),
+                "list": _fmt_price(list_price),
+            }
+        )
+    return cells
+
+
 def _price_bits(price: pricing.Price) -> str:
     """Render one model's three prices.
 
@@ -255,21 +283,32 @@ def _price_bits(price: pricing.Price) -> str:
         The input, output and cache read prices in one line.
     """
     parts = []
-    for label, (list_price, current) in (
-        ("输入", price.input_price),
-        ("输出", price.output_price),
-        ("缓存读取", price.cache_read_price),
-    ):
-        charged = _fmt_price(current)
+    for cell in _price_cells(price):
+        charged = cell["current"]
         if not charged:
-            parts.append(f"{label} —")
+            parts.append(f"{cell['label']} —")
             continue
-        struck = _fmt_price(list_price)
+        struck = cell["list"]
         if struck and struck != charged:
-            parts.append(f"{label} {charged}（刊例 {struck}）")
+            parts.append(f"{cell['label']} {charged}（刊例 {struck}）")
         else:
-            parts.append(f"{label} {charged}")
+            parts.append(f"{cell['label']} {charged}")
     return " · ".join(parts)
+
+
+def _price_summary(price: pricing.Price | None) -> str:
+    """Render one model's prices compactly for the overview list.
+
+    Args:
+        price: The price entry, or None when the model has no price.
+
+    Returns:
+        The three prices separated by slashes, empty when there is no price.
+    """
+    cells = _price_cells(price)
+    if not cells:
+        return ""
+    return "/".join(cell["current"] or "—" for cell in cells)
 
 
 WINDOW_UNITS = {"m": "分钟", "h": "小时", "d": "天"}
@@ -1070,12 +1109,13 @@ class MirasimStatus(Star):
                     text = self._render_model(data, query, await self._fetch_prices())
                 else:
                     show_all = bool(query)
+                    prices = await self._fetch_prices()
                     if self.config.get("render_image", True):
-                        path = await self._render_overview_image(data, show_all)
+                        path = await self._render_overview_image(data, show_all, prices)
                         if path:
                             yield event.image_result(path)
                             return
-                    text = self._render_overview(data, show_all)
+                    text = self._render_overview(data, show_all, prices)
         yield event.plain_result(text)
 
     def _render_subscriptions(self, umo: str) -> str:
@@ -1129,7 +1169,7 @@ class MirasimStatus(Star):
         return "\n".join(lines)
 
     def _overview_groups(
-        self, data: dict, show_all: bool
+        self, data: dict, show_all: bool, prices: pricing.PriceList | None = None
     ) -> tuple[list[dict], list[str], bool]:
         """Pick, filter and sort the models shown in the overview.
 
@@ -1141,6 +1181,7 @@ class MirasimStatus(Star):
         Args:
             data: Status payload.
             show_all: Ignore the ``display_models`` setting.
+            prices: The price list to price the models with.
 
         Returns:
             ``(groups, missing, filtered)`` where each group is one vendor with
@@ -1222,12 +1263,16 @@ class MirasimStatus(Star):
             for cohort_id, _m, _a in entries:
                 if cohort_id not in group["cohorts"]:
                     group["cohorts"].append(cohort_id)
+            price = prices.find(record["agent"], record["name"]) if prices else None
             group["models"].append(
                 {
                     "key": key,
                     "name": record["name"],
                     "entries": tagged,
                     "worst": _worst_status([s for s, _e in tagged]),
+                    "price": _price_cells(price),
+                    "price_summary": _price_summary(price),
+                    "price_flag": (price.badge or price.tag) if price else "",
                 }
             )
 
@@ -1250,23 +1295,27 @@ class MirasimStatus(Star):
             ordered.sort(key=lambda g: (STATUS_ORDER.get(g["worst"], 99), g["agent"]))
         return ordered, missing, filtered
 
-    def _render_overview(self, data: dict, show_all: bool) -> str:
+    def _render_overview(
+        self, data: dict, show_all: bool, prices: pricing.PriceList | None = None
+    ) -> str:
         """Render the status list of the configured models, or of all of them.
 
         Args:
             data: Status payload.
             show_all: Ignore the ``display_models`` setting.
+            prices: The price list to price the models with.
 
         Returns:
             The reply text.
         """
-        groups, missing, filtered = self._overview_groups(data, show_all)
+        groups, missing, filtered = self._overview_groups(data, show_all, prices)
         up = sum(g["up"] for g in groups)
         total = sum(g["total"] for g in groups)
         lines = [f"Mirasim 模型状态 · 正常 {up}/{total}"]
         if not groups:
             lines.append("暂无模型数据。")
         shown_cohorts: set[str] = set()
+        priced = False
         for group in groups:
             lines.append(f"{group['agent']} · {group['up']}/{group['total']} 正常")
             for model in group["models"]:
@@ -1278,24 +1327,42 @@ class MirasimStatus(Star):
                         f"{STATUS_ICONS.get(status, '❔')}"
                         f"{COHORT_NAMES.get(cohort_id, cohort_id)} {availability}"
                     )
-                lines.append(f"· {model['name']} — {' · '.join(segments)}")
+                line = f"· {model['name']} — {' · '.join(segments)}"
+                if model["price_summary"]:
+                    priced = True
+                    flag = (
+                        model["price_flag"].replace("限时 ", "")
+                        if model["price_flag"]
+                        else ""
+                    )
+                    line += f" · 💲 {model['price_summary']}"
+                    if flag:
+                        line += f" ⏳{flag}"
+                lines.append(line)
         _append_footer(lines, data, filtered, cohorts=shown_cohorts)
+        if priced:
+            lines.append(
+                "💲 价格为输入/输出/缓存读取，每百万 token 扣的额度（$1 = 1 额度）"
+            )
         if missing:
             lines.append(f"未找到：{'、'.join(missing)}")
         return "\n".join(lines)
 
-    async def _render_overview_image(self, data: dict, show_all: bool) -> str | None:
+    async def _render_overview_image(
+        self, data: dict, show_all: bool, prices: pricing.PriceList | None = None
+    ) -> str | None:
         """Render the overview as a card image through AstrBot's T2I service.
 
         Args:
             data: Status payload.
             show_all: Ignore the ``display_models`` setting.
+            prices: The price list to price the models with.
 
         Returns:
             Path of the rendered image, or None when rendering failed and the
             caller should fall back to text.
         """
-        groups, missing, filtered = self._overview_groups(data, show_all)
+        groups, missing, filtered = self._overview_groups(data, show_all, prices)
         counts: dict[str, int] = {}
         total_up = 0
         total_rows = 0
