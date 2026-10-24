@@ -136,19 +136,19 @@ class PriceBitsTest(unittest.TestCase):
     def test_plain_prices_have_no_list_price(self):
         entry = self.prices.entries["claude-opus-5-5"]
         self.assertEqual(
-            main_mod._price_bits(entry), "输入 4 · 输出 20 · 缓存读取 0.2"
+            main_mod._price_bits(entry), "输入 $4 · 输出 $20 · 缓存读取 $0.2"
         )
 
     def test_a_discounted_price_shows_the_list_price(self):
         entry = self.prices.entries["gpt-6-astra"]
         self.assertEqual(
             main_mod._price_bits(entry),
-            "输入 1（刊例 10） · 输出 5（刊例 50） · 缓存读取 0.1（刊例 1）",
+            "输入 $1（刊例 $10） · 输出 $5（刊例 $50） · 缓存读取 $0.1（刊例 $1）",
         )
 
     def test_a_missing_price_shows_a_dash(self):
         entry = self.prices.entries["kimi-k3"]
         self.assertEqual(
             main_mod._price_bits(entry),
-            "输入 0.3（刊例 3） · 输出 1.5 · 缓存读取 —",
+            "输入 $0.3（刊例 $3） · 输出 $1.5 · 缓存读取 —",
         )

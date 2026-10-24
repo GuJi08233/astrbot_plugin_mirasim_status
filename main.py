@@ -231,7 +231,7 @@ def _fmt_rate(value: object, *, short: bool = False) -> str:
 
 
 def _fmt_price(value: object) -> str:
-    """Format a price in credits per million tokens.
+    """Format a price in dollars per million tokens.
 
     Args:
         value: The price as a number.
@@ -290,9 +290,9 @@ def _price_bits(price: pricing.Price) -> str:
             continue
         struck = cell["list"]
         if struck and struck != charged:
-            parts.append(f"{cell['label']} {charged}（刊例 {struck}）")
+            parts.append(f"{cell['label']} ${charged}（刊例 ${struck}）")
         else:
-            parts.append(f"{cell['label']} {charged}")
+            parts.append(f"{cell['label']} ${charged}")
     return " · ".join(parts)
 
 
@@ -308,7 +308,7 @@ def _price_summary(price: pricing.Price | None) -> str:
     cells = _price_cells(price)
     if not cells:
         return ""
-    return "/".join(cell["current"] or "—" for cell in cells)
+    return "/".join(f"${cell['current']}" if cell["current"] else "—" for cell in cells)
 
 
 WINDOW_UNITS = {"m": "分钟", "h": "小时", "d": "天"}
@@ -1342,7 +1342,7 @@ class MirasimStatus(Star):
         _append_footer(lines, data, filtered, cohorts=shown_cohorts)
         if priced:
             lines.append(
-                "💲 价格为输入/输出/缓存读取，每百万 token 扣的额度（$1 = 1 额度）"
+                "💲 价格为输入/输出/缓存读取，每百万 token 扣多少美元（$1 = 1 额度）"
             )
         if missing:
             lines.append(f"未找到：{'、'.join(missing)}")
@@ -1429,6 +1429,7 @@ class MirasimStatus(Star):
             ),
             "notes": [str(n) for n in (data.get("notes") or []) if str(n).strip()],
             "source": "mirasim.ai",
+            "priced": any(model["price"] for g in groups for model in g["models"]),
         }
 
         try:
@@ -1544,7 +1545,7 @@ class MirasimStatus(Star):
         price = prices.find(record["agent"], record["name"])
         if price is not None:
             lines.append("")
-            lines.append("💲 价格（每百万 token 扣的额度，$1 = 1 额度）")
+            lines.append("💲 价格（每百万 token 扣多少美元，$1 = 1 额度）")
             lines.append(f"· {_price_bits(price)}")
             if price.discounted:
                 lines.append(
@@ -1565,7 +1566,7 @@ class MirasimStatus(Star):
             return "暂时取不到 Mirasim 的价目表，稍后再试。"
         lines = [
             "Mirasim 模型价目表",
-            "每百万 token 扣的额度，$1 = 1 额度",
+            "每百万 token 扣多少美元（$1 = 1 额度）",
             "",
         ]
         vendor = None

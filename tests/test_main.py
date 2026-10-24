@@ -818,9 +818,9 @@ class CommandTest(unittest.TestCase):
     def test_overview_shows_the_prices(self):
         self.plugin._fetch_prices = AsyncMock(return_value=PRICE_LIST)
         text = run(command(self.plugin))
-        self.assertIn("💲 4/20/0.2", text)
+        self.assertIn("💲 $4/$20/$0.2", text)
         # A discounted model says so and shows what is charged now.
-        self.assertIn("💲 1/5/0.1 ⏳1 折", text)
+        self.assertIn("💲 $1/$5/$0.1 ⏳1 折", text)
         self.assertIn("💲 价格为输入/输出/缓存读取", text)
 
     def test_overview_without_prices_shows_none(self):

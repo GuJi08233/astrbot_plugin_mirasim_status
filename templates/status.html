@@ -99,6 +99,7 @@ h1 { font-size: 22px; font-weight: 600; letter-spacing: .015em; margin-top: 6px;
 .empty { color: var(--muted); text-align: center; padding: 26px 14px; }
 .notes { margin-top: 12px; color: var(--degraded); font-size: 12px; }
 .notes li { margin-top: 3px; list-style: none; }
+.price-note { margin-top: 9px; color: var(--faint); font-size: 11px; }
 .footer {
   display: flex; justify-content: space-between; gap: 12px;
   margin-top: 14px; color: var(--faint); font-size: 11px;
@@ -141,7 +142,7 @@ h1 { font-size: 22px; font-weight: 600; letter-spacing: .015em; margin-top: 6px;
         {% if model.price %}
         <div class="model-price">
           {% for cell in model.price %}
-          <span class="price-item">{{ cell.label | e }} {% if cell.list %}<s>{{ cell.list | e }}</s> {% endif %}{{ cell.current | e }}</span>
+          <span class="price-item">{{ cell.label | e }} {% if cell.list %}<s>${{ cell.list | e }}</s> {% endif %}{% if cell.current %}${{ cell.current | e }}{% else %}—{% endif %}</span>
           {% endfor %}
           {% if model.price_flag %}<span class="price-flag">⏳ {{ model.price_flag | e }}</span>{% endif %}
         </div>
@@ -172,6 +173,7 @@ h1 { font-size: 22px; font-weight: 600; letter-spacing: .015em; margin-top: 6px;
   <div class="list" style="margin-top:14px;"><div class="empty">暂无模型数据</div></div>
   {% endfor %}
   {% if notes %}<ul class="notes">{% for note in notes %}<li>注：{{ note | e }}</li>{% endfor %}</ul>{% endif %}
+  {% if priced %}<p class="price-note">价格为每百万 token 扣多少美元（$1 = 1 额度），划掉的是刊例价</p>{% endif %}
   <div class="footer">
     <span>{% if filtered %}仅展示配置的模型 · /mirasim all 查看全部{% else %}右侧为最近 24 小时 48 格，旧 → 新{% endif %}</span>
     <span>{{ source | e }}</span>
